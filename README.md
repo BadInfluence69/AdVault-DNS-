@@ -14,7 +14,81 @@ Clean the noise. Reclaim the web.
 
 to use DNS  185.107.97.246
 
-use of thiw script on a Windows Server for best results.
+use of this script on a Windows Server for best results.
 
 Python Releases for Windows
 https://www.python.org/downloads/windows/
+
+---------------------------------------------------------
+DNS ad blocker
+
+DNS-based ad blocking
+
+Network-level ad blocker
+
+Python DNS ad blocker
+
+Privacy protection
+
+Ad filtering
+
+DNS filtering
+
+Block ads
+
+Block trackers
+
+Block malware
+
+Block phishing
+
+Block spam
+
+Open source DNS
+
+Ad-free browsing
+
+No tracking DNS
+
+No-logs DNS
+
+Fast DNS server
+
+Public DNS server
+
+Free DNS service
+
+Windows DNS ad blocker
+
+Clean internet
+
+User privacy
+
+Anti-tracking
+
+Anti-advertising
+
+DNS sinkhole
+
+Family-safe DNS
+
+Lightweight ad blocker
+
+Custom blocklists
+
+DNS resolver
+
+Secure browsing
+
+Browser-independent ad blocking
+
+IoT device protection
+
+Stop telemetry
+
+DNS over HTTPS (DoH)
+
+DNS over TLS (DoT)
+---------------------------------------------------------
+
+
