@@ -1,4 +1,4 @@
-# AdVault-DNS-
+# AdVault-DNS
 AdVault DNS is a python DNS Adblocker at the network level
 
 Why This DNS Service Exists
