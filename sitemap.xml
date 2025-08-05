@@ -1,0 +1,10 @@
+<?php
+header('Content-Type: application/xml; charset=utf-8');
+?>
+<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+    <url>
+        <loc>http://185.107.97.246/Advault/</loc>
+        <lastmod><?php echo date('Y-m-d'); ?></lastmod>
+        <priority>1.0</priority>
+    </url>
+</urlset>
