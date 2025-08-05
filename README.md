@@ -11,3 +11,10 @@ The goal is simple: give people a faster, cleaner, more respectful internet expe
 By pointing your device or router to this DNS, you're helping push back against the idea that users should be monetized before they’re respected. This service is open to the public, with no restrictions, no subscriptions, and no strings attached.
 
 Clean the noise. Reclaim the web.
+
+to use DNS  185.107.97.246
+
+use of thiw script on a Windows Server for best results.
+
+Python Releases for Windows
+https://www.python.org/downloads/windows/
