@@ -18,15 +18,12 @@ DOT_CERTFILE = "fullchain.pem"
 DOT_KEYFILE  = "privkey.pem"
 DOT_PORT     = 853
 UPSTREAMS    = [    
-    ("1.1.1.1", 53),         # Cloudflare
     ("8.8.8.8", 53),         # Google
-    ("208.67.222.222", 53),  # OpenDNS
-    ("84.200.69.80", 53),    # DNS.Watch (Germany)
-    ("91.239.100.100", 53),  # UncensoredDNS (Denmark)
+
     ]
 UPSTREAM_TCP_TIMEOUT = 4
 UPSTREAM_UDP_TIMEOUT = 4
-SINK_IPv4    = "185.107.97.246"
+SINK_IPv4    = "0.0.0.0"
 SINK_IPv6    = "::"
 DOT_HOSTNAME = os.environ.get("ADV_DNS_HOSTNAME", "localhost")
 
@@ -337,7 +334,7 @@ def _udp_query(query_bytes: bytes):
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
             s.settimeout(UPSTREAM_UDP_TIMEOUT)
             s.sendto(query_bytes, up)
-            resp, _ = s.recvfrom(65535)
+            resp, _ = s.recvfrom(1000000000)
             return resp
     except Exception as e:
         log_message(f"UDP failed on {up}: {e}", color=Fore.YELLOW)
@@ -466,7 +463,7 @@ def start_udp_server(host="0.0.0.0", port=53):
             return
         while True:
             try:
-                data, addr = sock.recvfrom(10000)
+                data, addr = sock.recvfrom(10000000000)
                 handle_request(data, addr, sock)
             except KeyboardInterrupt:
                 break
@@ -581,7 +578,7 @@ if __name__ == "__main__":
         load_lists_into_memory()
 
         # Start DoT
-        dot_started = False
+        dot_started = True
         try:
             dot = DoTServer()
             dot.start()
