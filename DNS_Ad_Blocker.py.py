@@ -1,56 +1,66 @@
-# AdVault DNS — Unified Single-File Resolver (+ DNS-over-TLS with auto cert)
-# created by: "Brian Cambron" | Github: https://github.com/BadInfluence69/AdVault-DNS-
-# revised: “don’t delete my blocklist” edition, with fixed active user tracking
+# =============================================================
+# AdVault DNS — Local Unified Resolver + DoT (Self-Signed TLS)
+# Created by: Brian Cambron (https://github.com/BadInfluence69/AdVault-DNS-)
+# Edition: “Local Autonomous Mode” — applies blocking to host + LAN
+# =============================================================
 
-import os, sys, io, re, time, socket, ssl, struct, threading, datetime, tempfile, signal, json
-sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
-sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace')
-
+import os, sys, io, re, time, socket, ssl, struct, threading, datetime, tempfile, signal, json, subprocess
 import requests
 from dnslib import DNSRecord, QTYPE, RR, A, AAAA, RCODE
 from colorama import Fore, Style, init
 init(autoreset=True)
 
-# ============================
+# =============================================================
 # SETTINGS
-# ============================
+# =============================================================
 DOT_CERTFILE = "fullchain.pem"
 DOT_KEYFILE  = "privkey.pem"
 DOT_PORT     = 853
-UPSTREAMS    = [    
-    ("8.8.8.8", 53),         # Google
-
-    ]
-UPSTREAM_TCP_TIMEOUT = 4
-UPSTREAM_UDP_TIMEOUT = 4
-SINK_IPv4    = "0.0.0.0"
-SINK_IPv6    = "::"
 DOT_HOSTNAME = os.environ.get("ADV_DNS_HOSTNAME", "localhost")
 
-# Cache: max entries and default TTL cap
-CACHE_MAX_ENTRIES = 50000
-CACHE_TTL_CAP = 3600
+# Redundant upstreams (DNS providers)
+UPSTREAMS = [
+    ("8.8.8.8", 53),       # Google DNS
+    ("1.1.1.1", 53),       # Cloudflare
+    ("9.9.9.9", 53),       # Quad9
+    ("208.67.222.222", 53) # OpenDNS
+]
+UPSTREAM_TCP_TIMEOUT = 4
+UPSTREAM_UDP_TIMEOUT = 4
 
-blocklist_file   = "dynamic_blocklist.txt"
-allowlist_file   = "allowlist.txt"
-discovered_file  = "discovered_blocklist.txt"
-ad_insights_log  = "ad_insights.txt"
-catalog_file     = "candidates_catalog.json"
-USERS_FILE           = "current_users.txt"
+# Sinkhole IPs
+SINK_IPv4 = "0.0.0.0"
+SINK_IPv6 = "::"
+
+CACHE_MAX_ENTRIES = 50000000
+CACHE_TTL_CAP = 50000000
+
+# Files
+blocklist_file = "dynamic_blocklist.txt"
+allowlist_file = "allowlist.txt"
+discovered_file = "discovered_blocklist.txt"
+ad_insights_log = "ad_insights.txt"
+catalog_file = "candidates_catalog.json"
+USERS_FILE = "current_users.txt"
+
 USERS_WRITE_INTERVAL = 3
-USERS_ACTIVE_WINDOW  = 3
+USERS_ACTIVE_WINDOW = 3
 
-blocklist_urls = []  # add remote blocklist sources here
+blocklist_urls = []  # optionally add remote lists later
 
+# =============================================================
+# CORE WHITELIST (non-blockable)
+# =============================================================
 allowlist_critical = {
-    "det_apb_b","ab_det_apm","ab_ab_det_el_h","ab_det_em_inj","ab_det_pp_ov",
-    "ab_l_sig_st","ab_l_sig_st_e","ab_sa_ef",
     "youtube.com","ytimg.com","pirateproxy-bay.com","i.ytimg.com","s.ytimg.com",
     "lh3.googleusercontent.com","yt3.ggpht.com","youtubei.googleapis.com","chart.js","AdVault",
     "tv.youtube.com","ytp-player-content","ytp-iv-player-content",
     "allow-storage-access-by-user-activation","allow-scripts","accounts.google.com"
 }
 
+# =============================================================
+# AD KEYWORDS
+# =============================================================
 AD_HOST_KEYWORDS = [
     "ad.", ".ad.", "ads.", ".ads.", "adservice", "adserver", "advert", "doubleclick",
     "googlesyndication", "googletagservices", "googletagmanager", "adnxs", "moatads",
@@ -63,37 +73,35 @@ AD_HOST_KEYWORDS = [
 ]
 
 keyword_blocklist = list(set([
-    "banner", "Banner", "Ad", "Ads", "advertisement", "trafficjunky.com",
-    "media.trafficjunky.net","ads.trafficjunky.com", "track.trafficjunky.com",
-    "cdn.trafficjunky.com", "adtng.com", "trafficfactory", "ads.trafficfactory",
-    "track.trafficfactory", "cdn.trafficfactory", "pb_iframe", "creatives"
+    "banner","Banner","Ad","Ads","advertisement","trafficjunky.com",
+    "media.trafficjunky.net","ads.trafficjunky.com","track.trafficjunky.com",
+    "cdn.trafficjunky.com","adtng.com","trafficfactory","ads.trafficfactory",
+    "track.trafficfactory","cdn.trafficfactory","pb_iframe","creatives"
 ]))
 
-# ============================
-# GLOBAL STATE
-# ============================
+# =============================================================
+# GLOBALS
+# =============================================================
 discover_lock = threading.Lock()
 lists_lock = threading.Lock()
 catalog_lock = threading.Lock()
 cache_lock = threading.Lock()
+_active_lock = threading.Lock()
 
 blocklist = set()
 allowlist = set()
-_up_idx = 0
-dns_cache = dict()
-
-# Active user tracker
+dns_cache = {}
 _active_clients = {}
-_active_lock = threading.Lock()
+_up_idx = 0
 
-# ============================
-# HELPERS
-# ============================
-def log_message(message, color=Fore.WHITE):
+# =============================================================
+# UTILS
+# =============================================================
+def log_message(msg, color=Fore.WHITE):
     ts = datetime.datetime.now().strftime("[%Y-%m-%d %H:%M:%S]")
-    print(f"{color}{ts} {message}{Style.RESET_ALL}")
+    print(f"{color}{ts} {msg}{Style.RESET_ALL}")
 
-def _normalize_domain(domain: str) -> str:
+def _normalize_domain(domain):
     d = domain.strip().strip(".").lower()
     try:
         d = d.encode("idna").decode("ascii")
@@ -101,11 +109,11 @@ def _normalize_domain(domain: str) -> str:
         pass
     return d
 
-def is_valid_domain(domain: str) -> bool:
+def is_valid_domain(domain):
     domain = _normalize_domain(domain)
     return bool(re.match(r"^(?:[a-z0-9-]{1,63}\.)+[a-z]{2,}$", domain))
 
-def domain_in_set_or_parent(domain: str, s: set) -> bool:
+def domain_in_set_or_parent(domain, s):
     d = _normalize_domain(domain)
     if d in s:
         return True
@@ -115,160 +123,34 @@ def domain_in_set_or_parent(domain: str, s: set) -> bool:
             return True
     return False
 
-def atomic_write(path: str, data: str):
-    tmp = None
-    try:
-        fd, tmp = tempfile.mkstemp(prefix=".tmp-", dir=os.path.dirname(path) or ".")
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            f.write(data)
-        os.replace(tmp, path)
-    finally:
-        try:
-            if tmp and os.path.exists(tmp):
-                os.remove(tmp)
-        except Exception:
-            pass
+def atomic_write(path, data):
+    fd, tmp = tempfile.mkstemp(prefix=".tmp-", dir=os.path.dirname(path) or ".")
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.write(data)
+    os.replace(tmp, path)
 
-def atomic_write_lines(path: str, items: set):
-    atomic_write(path, "".join(sorted(d+"\n" for d in items)))
+def atomic_write_lines(path, items):
+    atomic_write(path, "".join(sorted(d + "\n" for d in items)))
 
-# ============================
-# FILE IO
-# ============================
-def load_file_domains(file_path: str) -> set:
+# =============================================================
+# FILE HANDLERS
+# =============================================================
+def load_file_domains(file_path):
     try:
         with open(file_path, "r", encoding="utf-8") as f:
             return {_normalize_domain(line) for line in f if is_valid_domain(line)}
     except FileNotFoundError:
         return set()
 
-def save_domains(file_path: str, domains: set):
+def save_domains(file_path, domains):
     try:
         atomic_write_lines(file_path, domains)
     except Exception as e:
-        log_message(f"Error saving {file_path}: {e}", color=Fore.RED)
+        log_message(f"Error saving {file_path}: {e}", Fore.RED)
 
-def load_catalog() -> dict:
-    try:
-        with open(catalog_file, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return {}
-
-def save_catalog(cat: dict):
-    try:
-        atomic_write(catalog_file, json.dumps(cat, ensure_ascii=False, indent=2))
-    except Exception as e:
-        log_message(f"Error saving {catalog_file}: {e}", color=Fore.RED)
-
-# ============================
-# HTTP USER-AGENT SPOOF
-# ============================
-http = requests.Session()
-http.headers.update({
-    "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-                  "(KHTML, like Gecko) Chrome/99.0.0.0 Safari/537.36",
-    "Accept": "*/*", "Connection": "close",
-})
-
-def fetch_blocklist(url):
-    try:
-        r = http.get(url, timeout=10)
-        r.raise_for_status()
-        return r.text
-    except requests.exceptions.RequestException as e:
-        log_message(f"Failed to fetch blocklist from {url}: {e}", color=Fore.YELLOW)
-        return ""
-
-def parse_blocklist(raw_data):
-    domains = set()
-    for line in raw_data.splitlines():
-        line = line.strip()
-        if not line or line.startswith("#"): continue
-        if "||" in line:
-            domain = line.split("||",1)[1].split("^",1)[0]
-        elif "$" in line:
-            m = re.search(r"domain=([a-zA-Z0-9.-]+)", line)
-            domain = m.group(1) if m else ""
-        else:
-            domain = line
-        domain = _normalize_domain(domain)
-        if is_valid_domain(domain):
-            domains.add(domain)
-    return domains
-
-# ============================
-# BLOCK/ALLOW LIST MGMT
-# ============================
-def compact_discovered_blocklist():
-    discovered = load_file_domains(discovered_file)
-    if discovered:
-        save_domains(discovered_file, discovered)
-        log_message(f"Compacted discovered list to {len(discovered)} domains.", color=Fore.CYAN)
-
-def update_blocklist_preserve():
-    with lists_lock:
-        existing = load_file_domains(blocklist_file)
-        collected = set(existing)
-        for url in blocklist_urls:
-            log_message(f"Fetching blocklist from {url}...", color=Fore.CYAN)
-            raw = fetch_blocklist(url)
-            if raw:
-                ds = parse_blocklist(raw)
-                log_message(f"Extracted {len(ds)} valid domains from {url}.", color=Fore.CYAN)
-                collected.update(ds)
-
-        local_discovered = load_file_domains(discovered_file)
-        if local_discovered:
-            log_message(f"Including {len(local_discovered)} locally discovered ad domains.", color=Fore.CYAN)
-            collected.update(local_discovered)
-
-        save_domains(blocklist_file, collected)
-        log_message(f"Blocklist updated with {len(collected)} domains (no deletions).", color=Fore.GREEN)
-
-def load_lists_into_memory():
-    global blocklist, allowlist
-    with lists_lock:
-        blocklist = load_file_domains(blocklist_file)
-        allowlist = load_file_domains(allowlist_file)
-    log_message(f"In-memory lists: block={len(blocklist)} allow={len(allowlist)}", color=Fore.CYAN)
-
-# ============================
-# DISCOVERY
-# ============================
-def hostname_is_ad_candidate(domain: str) -> bool:
-    d = _normalize_domain(domain)
-    return any(k in d for k in AD_HOST_KEYWORDS)
-
-def catalog_candidate(domain: str):
-    d = _normalize_domain(domain)
-    if not is_valid_domain(d): return
-    if domain_in_set_or_parent(d, allowlist_critical) or domain_in_set_or_parent(d, allowlist):
-        return
-    if d in blocklist: return
-    with catalog_lock:
-        cat = load_catalog()
-        now = int(time.time())
-        if d not in cat:
-            cat[d] = {"count": 1, "first": now, "last": now}
-        else:
-            cat[d]["count"] += 1
-            cat[d]["last"] = now
-        save_catalog(cat)
-
-def add_discovered_domain(domain: str):
-    d = _normalize_domain(domain)
-    if not is_valid_domain(d): return
-    if domain_in_set_or_parent(d, allowlist_critical) or domain_in_set_or_parent(d, allowlist):
-        return
-    if d in blocklist: return
-    with discover_lock:
-        current = load_file_domains(discovered_file)
-        if d in current: return
-        current.add(d)
-        save_domains(discovered_file, current)
-        log_message(f"Discovered ad domain added: {d}", color=Fore.MAGENTA)
-
+# =============================================================
+# NETWORK & BLOCKLIST
+# =============================================================
 def is_blocked(domain):
     d = _normalize_domain(domain)
     if domain_in_set_or_parent(d, allowlist_critical) or domain_in_set_or_parent(d, allowlist):
@@ -280,21 +162,47 @@ def is_blocked(domain):
             return True
     return False
 
-# ============================
+def _next_upstream():
+    global _up_idx
+    up = UPSTREAMS[_up_idx % len(UPSTREAMS)]
+    _up_idx += 1
+    return up
+
+def _udp_query(qbytes):
+    up = _next_upstream()
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+        s.settimeout(UPSTREAM_UDP_TIMEOUT)
+        s.sendto(qbytes, up)
+        resp, _ = s.recvfrom(65535)
+        return resp
+
+def _tcp_query(qbytes):
+    up = _next_upstream()
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.settimeout(UPSTREAM_TCP_TIMEOUT)
+        s.connect(up)
+        s.sendall(struct.pack("!H", len(qbytes)) + qbytes)
+        lp = s.recv(2)
+        if not lp:
+            return None
+        (msg_len,) = struct.unpack("!H", lp)
+        return s.recv(msg_len)
+
+# =============================================================
 # CACHE
-# ============================
-def cache_get(qname: str, qtype: int):
-    k = (qname, qtype)
+# =============================================================
+def cache_get(qname, qtype):
     with cache_lock:
-        v = dns_cache.get(k)
-        if not v: return None
+        v = dns_cache.get((qname, qtype))
+        if not v:
+            return None
         exp, blob = v
         if exp < time.time():
-            dns_cache.pop(k, None)
+            dns_cache.pop((qname, qtype), None)
             return None
         return blob
 
-def cache_put(qname: str, qtype: int, reply: DNSRecord):
+def cache_put(qname, qtype, reply):
     try:
         ttls = [rr.ttl for rr in reply.rr if str(rr.rname).strip(".").lower() == qname]
         ttl = max(5, min(CACHE_TTL_CAP, min(ttls) if ttls else 30))
@@ -307,66 +215,20 @@ def cache_put(qname: str, qtype: int, reply: DNSRecord):
     except Exception:
         pass
 
-# ============================
-# CORE RESOLUTION
-# ============================
-def _next_upstream():
-    global _up_idx
-    up = UPSTREAMS[_up_idx % len(UPSTREAMS)]
-    _up_idx += 1
-    return up
-
-def _recv_exact(sock, n: int):
-    buf = bytearray()
-    while len(buf) < n:
-        try:
-            chunk = sock.recv(n - len(buf))
-        except socket.timeout:
-            return None
-        if not chunk:
-            return None
-        buf += chunk
-    return bytes(buf)
-
-def _udp_query(query_bytes: bytes):
-    up = _next_upstream()
+# =============================================================
+# RESOLVER
+# =============================================================
+def resolve_query(qbytes):
     try:
-        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
-            s.settimeout(UPSTREAM_UDP_TIMEOUT)
-            s.sendto(query_bytes, up)
-            resp, _ = s.recvfrom(1000000000)
-            return resp
-    except Exception as e:
-        log_message(f"UDP failed on {up}: {e}", color=Fore.YELLOW)
-        raise
+        req = DNSRecord.parse(qbytes)
+        qname = _normalize_domain(str(req.q.qname))
+        qtype = req.q.qtype
 
-def _tcp_query(query_bytes: bytes):
-    up = _next_upstream()
-    try:
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            s.settimeout(UPSTREAM_TCP_TIMEOUT)
-            s.connect(up)
-            s.sendall(struct.pack("!H", len(query_bytes)) + query_bytes)
-            lp = _recv_exact(s, 2)
-            if not lp:
-                return None
-            (msg_len,) = struct.unpack("!H", lp)
-            return _recv_exact(s, msg_len)
-    except Exception as e:
-        log_message(f"TCP failed on {up}: {e}", color=Fore.YELLOW)
-        raise
-
-def resolve_query(query_bytes: bytes) -> bytes:
-    try:
-        request = DNSRecord.parse(query_bytes)
-        qname = _normalize_domain(str(request.q.qname))
-        qtype = request.q.qtype
-
-        if hostname_is_ad_candidate(qname):
-            catalog_candidate(qname)
+        log_message(f"Query: {qname}", Fore.WHITE)
 
         if is_blocked(qname):
-            reply = request.reply()
+            log_message(f"BLOCKED: {qname}", Fore.RED)
+            reply = req.reply()
             if qtype in (QTYPE.A, QTYPE.ANY):
                 reply.add_answer(RR(qname, QTYPE.A, rdata=A(SINK_IPv4), ttl=60))
             if qtype in (QTYPE.AAAA, QTYPE.ANY):
@@ -375,226 +237,153 @@ def resolve_query(query_bytes: bytes) -> bytes:
 
         cached = cache_get(qname, qtype)
         if cached:
+            log_message(f"CACHE HIT: {qname}", Fore.CYAN)
             return cached
 
-        errors = []
         for _ in range(len(UPSTREAMS)):
             try:
-                # Try UDP
-                resp = _udp_query(query_bytes)
+                resp = _udp_query(qbytes)
                 parsed = DNSRecord.parse(resp)
                 if parsed.header.tc == 1:
-                    raise ValueError("TC bit set")
+                    raise ValueError("Truncated")
                 break
-            except Exception as e_udp:
-                errors.append(f"UDP: {e_udp}")
-                try:
-                    resp = _tcp_query(query_bytes)
-                    if resp:
-                        break
-                except Exception as e_tcp:
-                    errors.append(f"TCP: {e_tcp}")
+            except Exception:
+                resp = _tcp_query(qbytes)
+                if resp:
+                    break
         else:
-            log_message(f"All upstreams failed for {qname}: {errors}", color=Fore.RED)
-            raise Exception("All upstreams failed")
+            log_message(f"All upstreams failed for {qname}", Fore.RED)
+            raise Exception("No upstreams")
 
         parsed = DNSRecord.parse(resp)
-        if hostname_is_ad_candidate(qname) and not is_blocked(qname):
-            add_discovered_domain(qname)
         cache_put(qname, qtype, parsed)
+        log_message(f"RESOLVED: {qname}", Fore.GREEN)
         return resp
 
     except Exception as e:
-        log_message(f"Resolver error: {e}", color=Fore.RED)
+        log_message(f"Resolver error: {e}", Fore.RED)
         try:
-            req = DNSRecord.parse(query_bytes)
+            req = DNSRecord.parse(qbytes)
             servfail = req.reply()
             servfail.header.rcode = RCODE.SERVFAIL
             return servfail.pack()
         except Exception:
             return b""
 
-# ============================
+# =============================================================
+# UDP SERVER
+# =============================================================
+def handle_request(data, addr, sock):
+    try:
+        resp = resolve_query(data)
+        if resp:
+            sock.sendto(resp, addr)
+            mark_active(addr)
+    except Exception as e:
+        log_message(f"Error handling {addr}: {e}", Fore.RED)
+
+def start_udp_server(host="0.0.0.0", port=53):
+    log_message(f"Starting UDP DNS on {host}:{port}", Fore.CYAN)
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+        try:
+            sock.bind((host, port))
+        except PermissionError:
+            log_message("Permission denied! Run as Admin.", Fore.RED)
+            return
+        while True:
+            data, addr = sock.recvfrom(65535)
+            threading.Thread(target=handle_request, args=(data, addr, sock), daemon=True).start()
+
+# =============================================================
+# DoT SERVER
+# =============================================================
+class DoTServer(threading.Thread):
+    def __init__(self, host="0.0.0.0", port=DOT_PORT):
+        super().__init__(daemon=True)
+        self.host = host
+        self.port = port
+        self.ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        self.ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+        try:
+            self.ctx.load_cert_chain(certfile=DOT_CERTFILE, keyfile=DOT_KEYFILE)
+        except Exception as e:
+            log_message(f"TLS init failed: {e}", Fore.YELLOW)
+
+    def run(self):
+        base = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        base.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        base.bind((self.host, self.port))
+        base.listen(200)
+        log_message(f"DNS-over-TLS running on {self.host}:{self.port}", Fore.GREEN)
+        while True:
+            client, addr = base.accept()
+            threading.Thread(target=self.handle, args=(client, addr), daemon=True).start()
+
+    def handle(self, client, addr):
+        try:
+            with self.ctx.wrap_socket(client, server_side=True) as tls:
+                while True:
+                    lp = tls.recv(2)
+                    if not lp:
+                        break
+                    (msg_len,) = struct.unpack("!H", lp)
+                    query = tls.recv(msg_len)
+                    resp = resolve_query(query)
+                    if not resp:
+                        break
+                    tls.sendall(struct.pack("!H", len(resp)) + resp)
+        except Exception:
+            pass
+        finally:
+            client.close()
+
+# =============================================================
 # ACTIVE USER TRACKING
-# ============================
+# =============================================================
 def mark_active(addr):
     ip = addr[0]
     now = time.time()
     with _active_lock:
         _active_clients[ip] = now
 
-def _prune_and_count(now=None):
-    if now is None: now = time.time()
-    cutoff = now - USERS_ACTIVE_WINDOW
-    with _active_lock:
-        stale = [ip for ip, ts in _active_clients.items() if ts < cutoff]
-        for ip in stale:
-            _active_clients.pop(ip, None)
-        return len(_active_clients)
-
 def write_current_users_periodically():
     while True:
-        try:
-            count = _prune_and_count()
-            atomic_write(USERS_FILE, str(count))
-        except Exception as e:
-            log_message(f"User count write fail: {e}", Fore.YELLOW)
+        now = time.time()
+        cutoff = now - USERS_ACTIVE_WINDOW
+        with _active_lock:
+            for ip in list(_active_clients.keys()):
+                if _active_clients[ip] < cutoff:
+                    _active_clients.pop(ip, None)
+            atomic_write(USERS_FILE, str(len(_active_clients)))
         time.sleep(USERS_WRITE_INTERVAL)
 
-# ============================
-# UDP SERVER
-# ============================
-def handle_request(data, addr, sock):
-    try:
-        response = resolve_query(data)
-        if response:
-            sock.sendto(response, addr)
-            mark_active(addr)
-    except Exception as e:
-        log_message(f"Error handling request: {e}", color=Fore.RED)
-
-def start_udp_server(host="0.0.0.0", port=53):
-    log_message(f"Starting DNS (UDP) on {host}:{port}", color=Fore.CYAN)
-    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
-        try:
-            sock.bind((host, port))
-        except PermissionError:
-            log_message("Permission denied! Use port > 1024 or run as admin.", color=Fore.RED)
-            return
-        while True:
-            try:
-                data, addr = sock.recvfrom(10000000000)
-                handle_request(data, addr, sock)
-            except KeyboardInterrupt:
-                break
-            except Exception as e:
-                log_message(f"Non-fatal loop error: {e}", color=Fore.YELLOW)
-                time.sleep(0.2)
-    log_message("Shutting down UDP DNS.", color=Fore.CYAN)
-
-# ============================
-# DoT SERVER
-# ============================
-class DoTServer(threading.Thread):
-    def __init__(self, host="0.0.0.0", port=DOT_PORT, certfile=DOT_CERTFILE, keyfile=DOT_KEYFILE,
-                 tls_min_version=ssl.TLSVersion.TLSv1_2, ciphers=None, client_timeout=30.0, backlog=200):
-        super().__init__(daemon=True)
-        self.host = host
-        self.port = port
-        self.certfile = certfile
-        self.keyfile = keyfile
-        self.client_timeout = client_timeout
-        self.backlog = backlog
-        self._shutdown = threading.Event()
-        self._sock = None
-
-        ensure_self_signed_cert(self.certfile, self.keyfile, DOT_HOSTNAME)
-
-        self.ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-        self.ctx.minimum_version = tls_min_version
-        if ciphers:
-            self.ctx.set_ciphers(ciphers)
-        self.ctx.load_cert_chain(certfile=self.certfile, keyfile=self.keyfile)
-
-    def run(self):
-        base = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        base.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        base.bind((self.host, self.port))
-        base.listen(self.backlog)
-        self._sock = base
-        log_message(f"Starting DNS-over-TLS (TCP) on {self.host}:{self.port}", color=Fore.CYAN)
-        try:
-            while not self._shutdown.is_set():
-                try:
-                    client, addr = base.accept()
-                except OSError:
-                    break
-                threading.Thread(target=self.handle_client, args=(client, addr), daemon=True).start()
-        finally:
-            try:
-                base.close()
-            except Exception:
-                pass
-
-    def stop(self):
-        self._shutdown.set()
-        try:
-            if self._sock:
-                self._sock.close()
-        except Exception:
-            pass
-
-    def handle_client(self, client_sock, addr):
-        try:
-            client_sock.settimeout(self.client_timeout)
-            with self.ctx.wrap_socket(client_sock, server_side=True) as tls:
-                while True:
-                    lp = _recv_exact(tls, 2)
-                    if not lp:
-                        break
-                    (msg_len,) = struct.unpack("!H", lp)
-                    if msg_len == 0 or msg_len > 65535:
-                        break
-                    query = _recv_exact(tls, msg_len)
-                    if not query:
-                        break
-                    response = resolve_query(query)
-                    if not response:
-                        break
-                    tls.sendall(struct.pack("!H", len(response)) + response)
-        except (ssl.SSLError, ConnectionError, socket.timeout):
-            pass
-        except Exception as e:
-            log_message(f"DoT client error {addr}: {e}", color=Fore.YELLOW)
-        finally:
-            try:
-                client_sock.close()
-            except Exception:
-                pass
-
-# ============================
-# SIGNAL HANDLERS (reload)
-# ============================
-def handle_sighup(signum, frame):
-    log_message("SIGHUP received: reloading lists...", color=Fore.CYAN)
-    try:
-        compact_discovered_blocklist()
-        update_blocklist_preserve()
-        load_lists_into_memory()
-    except Exception as e:
-        log_message(f"Reload failed: {e}", color=Fore.RED)
-
-if hasattr(signal, "SIGHUP"):
-    signal.signal(signal.SIGHUP, handle_sighup)
-
-# ============================
-# MAIN
-# ============================
+# =============================================================
+# STARTUP
+# =============================================================
 if __name__ == "__main__":
+    log_message("Initializing AdVault DNS...", Fore.CYAN)
+
+    # Ensure certs exist
+    if not (os.path.exists(DOT_CERTFILE) and os.path.exists(DOT_KEYFILE)):
+        log_message("Generating self-signed TLS certificate...", Fore.CYAN)
+        subprocess.run([
+            "openssl", "req", "-x509", "-newkey", "rsa:2048",
+            "-keyout", DOT_KEYFILE, "-out", DOT_CERTFILE,
+            "-days", "365", "-nodes", "-subj", f"/CN={DOT_HOSTNAME}"
+        ], check=False)
+
+    # Load lists
+    blocklist = load_file_domains(blocklist_file)
+    allowlist = load_file_domains(allowlist_file)
+    log_message(f"Loaded blocklist: {len(blocklist)} domains", Fore.CYAN)
+    log_message(f"Loaded allowlist: {len(allowlist)} domains", Fore.CYAN)
+
+    # Start services
+    threading.Thread(target=write_current_users_periodically, daemon=True).start()
     try:
-        compact_discovered_blocklist()
-        log_message("Updating blocklist (no deletions)...", color=Fore.CYAN)
-        update_blocklist_preserve()
-        load_lists_into_memory()
-
-        # Start DoT
-        dot_started = True
-        try:
-            dot = DoTServer()
-            dot.start()
-            dot_started = True
-            log_message(f"DoT {'ENABLED' if dot_started else 'DISABLED'} (TLS on :{DOT_PORT}).",
-                        color=Fore.GREEN if dot_started else Fore.YELLOW)
-        except Exception as e:
-            log_message(f"DoT disabled (TLS init failed): {e}", color=Fore.YELLOW)
-
-        # background active-user writer
-        threading.Thread(target=write_current_users_periodically, daemon=True).start()
-
-        # Foreground UDP server
-        start_udp_server()
-
-    except KeyboardInterrupt:
-        log_message("Shutting down.", color=Fore.CYAN)
+        dot = DoTServer()
+        dot.start()
     except Exception as e:
-        log_message(f"FATAL ERROR: {e}", color=Fore.RED)
+        log_message(f"DoT disabled: {e}", Fore.YELLOW)
+
+    start_udp_server()
