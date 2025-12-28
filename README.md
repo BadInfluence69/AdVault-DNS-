@@ -13,7 +13,7 @@ Custom Blocklists: Allows users to create and manage their own blocklists for gr
 How it works
 AdVault DNS acts as a central point for resolving domain names to IP addresses. When a device connected to AdVault DNS attempts to access a website or app, it first queries AdVault DNS for the corresponding IP address. If the requested domain belongs to an advertising, tracking, or malicious entity, AdVault DNS intercepts the request and prevents access, effectively blocking the unwanted content before it can load. 
 How to use
-To leverage AdVault DNS, simply configure your device or router to use the provided DNS server address: 185.107.97.246. Refer to your device's or router's documentation for specific instructions on how to change your DNS settings. 
+To leverage AdVault DNS, simply configure your device or router to use the provided DNS server address: 72.51.249.70. Refer to your device's or router's documentation for specific instructions on how to change your DNS settings. 
 Benefits
 Improved Performance: Removes ad-related content, leading to faster page loading and a smoother browsing experience.
 Enhanced Privacy: Prevents companies from tracking your online activities and collecting your personal information.
