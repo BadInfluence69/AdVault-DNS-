@@ -22,7 +22,7 @@ Eliminates Annoyances: Reduces distractions from intrusive ads and pop-ups, crea
 System-wide Protection: Protects all devices connected to your network, including smartphones, tablets, smart TVs, and IoT devices. 
 By utilizing AdVault DNS, users can actively participate in reclaiming their browsing experience, promoting user privacy, and fostering a healthier online environment. 
 
-to use DNS  185.107.97.246
+to use DNS  72.51.249.70
 
 use of this script on a Windows Server for best results.
 
