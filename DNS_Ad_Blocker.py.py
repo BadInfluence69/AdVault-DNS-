@@ -3,11 +3,14 @@
 # revised: 03/16/2002
 
 import os, sys, io, re, time, socket, ssl, struct, threading, datetime, tempfile, signal, json
+import ipaddress, math
+from collections import Counter
+
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
 sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace')
 
 import requests
-from dnslib import DNSRecord, QTYPE, RR, A, AAAA, RCODE
+from dnslib import DNSRecord, QTYPE, RR, A, AAAA, RCODE, CNAME
 from colorama import Fore, Style, init
 init(autoreset=True)
 
@@ -24,7 +27,7 @@ SINK_IPv4    = "0.0.0.0"
 SINK_IPv6    = "::"
 DOT_HOSTNAME = os.environ.get("ADV_DNS_HOSTNAME", "localhost")
 
-CACHE_MAX_ENTRIES = 50000
+CACHE_MAX_ENTRIES = 500000000
 CACHE_TTL_CAP = 3600
 
 blocklist_file   = "dynamic_blocklist.txt"
@@ -38,6 +41,16 @@ USERS_ACTIVE_WINDOW  = 3
 
 blocklist_urls = [
     "http://127.0.0.1/Advault/dynamic_blocklist.txt",
+    "http://127.0.0.1/Advault/discovered_blocklist.txt",
+    "https://easylist.to/easylist/easylist.txt",
+    "https://easylist.to/easylist/easyprivacy.txt",
+    "https://pgl.yoyo.org/adservers/serverlist.php?hostformat=hosts&showintro=0&mimetype=plaintext",
+    "https://filters.adtidy.org/extension/chromium/filters/2.txt",
+    "https://filters.adtidy.org/extension/chromium/filters/3.txt",
+    "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/adblock/pro.txt",
+    "https://big.oisd.nl/",
+    "https://badmojr.github.io/1Hosts/Lite/domains.txt",
+    "https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts",
 ]
 
 allowlist_critical = {
@@ -48,7 +61,7 @@ allowlist_critical = {
 }
 
 AD_HOST_KEYWORDS = [
-    "ad.", ".ad.", "ads.", ".ads.", "adservice", "adserver", "advert", "doubleclick",
+     "ad.", ".ad.", "ads.", ".ads.", "adservice", "adserver", "advert", "doubleclick",
     "googlesyndication", "googletagservices", "googletagmanager", "adnxs", "moatads",
     "taboola", "outbrain", "criteo", "rubiconproject", "serving-sys", "zemanta",
     "pubmatic", "yieldmo", "omtrdc", "scorecardresearch", "zedo", "revcontent",
@@ -59,11 +72,61 @@ AD_HOST_KEYWORDS = [
 ]
 
 keyword_blocklist = list(set([
-    "banner", "Banner", "Ad", "Ads", "advertisement", "trafficjunky.com",
+    "SCTE-35", "banner", "Banner", "Ad", "Ads", "advertisement", "trafficjunky.com",
     "media.trafficjunky.net","ads.trafficjunky.com", "track.trafficjunky.com",
     "cdn.trafficjunky.com", "adtng.com", "trafficfactory", "ads.trafficfactory",
-    "track.trafficfactory", "cdn.trafficfactory", "pb_iframe", "creatives"
+    "track.trafficfactory", "cdn.trafficfactory", "pb_iframe", "creatives",
+    "metrics",
+    "analytics",
+    "telemetry",
+    "insight",
+    "experiment",
+    "abtest",
+    "optimize",
+    "personalize",
+    "audience",
+    "segment",
+    "segmentio",
+    "snowplow",
+    "amplitude",
+    "mixpanel",
+    "newrelic",
+    "datadog",
+    "app-measurement",
+    "firebase",
+    "measurement",
+    "stats",
+    "collect",
+    "collector",
+    "events",
+    "logging",
+    "monitor",
 ]))
+
+# Ad Detection
+
+DETECT_AD_MARKERS            = True
+DETECT_AD_INJECTION          = True
+AUTO_BLOCK_INJECTED_CNAME    = True   # If an allowed name CNAMEs into an ad/tracker, sink it
+LOG_AD_INSIGHTS              = True
+
+# Extra marker keywords (in addition to AD_HOST_KEYWORDS / keyword_blocklist)
+AD_MARKER_KEYWORDS = [
+    "scte-35", "scte35",
+    "admarker", "ad-mark", "ad_mark",
+    "adbreak", "ad-break", "ad_break",
+    "preroll", "midroll", "postroll",
+    "vast", "vpaid", "ima", "adtag", "ad-tag", "ad_tag",
+    "doubleclick", "googlesyndication", "googletagmanager", "googletagservices",
+    "tracking", "tracker", "telemetry", "marker", "analytics", "pixel", "beacon",
+]
+
+# NXDOMAIN / wildcard hijack-ish detection (best-effort heuristic)
+INJECTION_WILDCARD_WINDOW   = 300   # 5 minutes
+INJECTION_WILDCARD_THRESHOLD = 25   # distinct random-ish names pointing to same IP in window
+INJECTION_WILDCARD_TTL_MAX   = 120  # low TTL is common in hijack/wildcard setups
+_injection_lock = threading.Lock()
+_injection_ip_stats = {}  # ip -> {"first":ts,"last":ts,"names":set([...])}
 
 # ============================
 # GLOBAL STATE
@@ -79,6 +142,8 @@ _up_idx = 0
 dns_cache = dict()
 _active_clients = {}
 _active_lock = threading.Lock()
+
+_insights_lock = threading.Lock()
 
 # ============================
 # HELPERS
@@ -125,6 +190,254 @@ def atomic_write(path: str, data: str):
 
 def atomic_write_lines(path: str, items: set):
     atomic_write(path, "".join(sorted(d+"\n" for d in items)))
+
+def append_line(path: str, line: str):
+    # Thread-safe append for insights (minimal overhead)
+    try:
+        with _insights_lock:
+            with open(path, "a", encoding="utf-8", errors="replace") as f:
+                f.write(line.rstrip("\n") + "\n")
+    except Exception:
+        pass
+
+def _now_ts() -> str:
+    return datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+def log_ad_insight(kind: str, client_ip: str, qname: str, detail: str = ""):
+    if not LOG_AD_INSIGHTS:
+        return
+    line = f"[{_now_ts()}] {kind} | client={client_ip or 'unknown'} | host={qname} | {detail}".rstrip()
+    append_line(ad_insights_log, line)
+
+def _shannon_entropy(s: str) -> float:
+    if not s:
+        return 0.0
+    c = Counter(s)
+    n = len(s)
+    ent = 0.0
+    for k, v in c.items():
+        p = v / n
+        ent -= p * math.log2(p)
+    return ent
+
+def looks_like_random_subdomain(domain: str) -> bool:
+    """
+    Very light heuristic: flags some DGA-ish / tracking-ish random labels.
+    This is NOT a block rule by itself—only a signal for logging/injection heuristics.
+    """
+    d = _normalize_domain(domain)
+    parts = d.split(".")
+    if len(parts) < 3:
+        return False
+
+    left = parts[0]
+    if len(left) < 14:
+        return False
+
+    # High entropy label with many digits tends to be tracking / cache-bust
+    ent = _shannon_entropy(left)
+    digit_ratio = sum(ch.isdigit() for ch in left) / max(1, len(left))
+    vowel_ratio = sum(ch in "aeiou" for ch in left) / max(1, len(left))
+
+    if ent >= 3.2 and digit_ratio >= 0.20:
+        return True
+    if ent >= 3.5 and vowel_ratio <= 0.20:
+        return True
+    return False
+
+def is_private_or_special_ip(ip_str: str) -> bool:
+    try:
+        ip = ipaddress.ip_address(ip_str)
+        return bool(
+            ip.is_private or ip.is_loopback or ip.is_multicast or ip.is_reserved or
+            ip.is_link_local or ip.is_unspecified
+        )
+    except Exception:
+        return False
+
+def _collect_cname_targets(dnsrec: DNSRecord) -> list:
+    targets = []
+    try:
+        # Check answers, authority, additional
+        for rr in list(getattr(dnsrec, "rr", [])) + list(getattr(dnsrec, "auth", [])) + list(getattr(dnsrec, "ar", [])):
+            try:
+                if rr.rtype == QTYPE.CNAME:
+                    t = _normalize_domain(str(rr.rdata.label))
+                    if t:
+                        targets.append(t)
+            except Exception:
+                pass
+    except Exception:
+        pass
+    return targets
+
+def _collect_a_aaaa_answers(dnsrec: DNSRecord) -> list:
+    ips = []
+    try:
+        for rr in list(getattr(dnsrec, "rr", [])):
+            try:
+                if rr.rtype == QTYPE.A:
+                    ips.append((str(rr.rdata), rr.ttl))
+                elif rr.rtype == QTYPE.AAAA:
+                    ips.append((str(rr.rdata), rr.ttl))
+            except Exception:
+                pass
+    except Exception:
+        pass
+    return ips
+
+def _track_possible_wildcard_injection(qname: str, ips_with_ttl: list, client_ip: str):
+    """
+    Best-effort heuristic for wildcard/NXDOMAIN-hijack-like behavior:
+    many random-ish hostnames mapping to the same IP within a short window.
+    (With Google upstream this is unlikely, but the logic is here as requested.)
+    """
+    if not ips_with_ttl:
+        return
+
+    d = _normalize_domain(qname)
+    if not looks_like_random_subdomain(d):
+        return
+
+    # Use first IP as primary signal
+    ip, ttl = ips_with_ttl[0]
+    if ttl is None:
+        ttl = 0
+
+    # Low TTL is a common indicator (not definitive)
+    if ttl > INJECTION_WILDCARD_TTL_MAX:
+        return
+
+    now = time.time()
+    with _injection_lock:
+        st = _injection_ip_stats.get(ip)
+        if not st:
+            st = {"first": now, "last": now, "names": set()}
+            _injection_ip_stats[ip] = st
+
+        st["last"] = now
+        st["names"].add(d)
+
+        # Prune old
+        cutoff = now - INJECTION_WILDCARD_WINDOW
+        for k in list(_injection_ip_stats.keys()):
+            if _injection_ip_stats[k]["last"] < cutoff:
+                _injection_ip_stats.pop(k, None)
+
+        # Trigger if too many distinct random-ish names to same IP
+        if len(st["names"]) >= INJECTION_WILDCARD_THRESHOLD:
+            detail = f"suspected_wildcard_or_hijack ip={ip} distinct_randomish={len(st['names'])} ttl<= {INJECTION_WILDCARD_TTL_MAX}"
+            log_message(f"AD INJECTION SUSPECT (wildcard/hijack): {detail}", color=Fore.MAGENTA)
+            log_ad_insight("INJECTION_WILDCARD", client_ip, d, detail)
+
+def detect_ad_markers(client_ip: str, qname: str, qtype: int):
+    if not DETECT_AD_MARKERS:
+        return
+
+    d = _normalize_domain(qname)
+    qtype_name = QTYPE.get(qtype, str(qtype))
+
+    # Marker keyword hits (lowercased)
+    marker_hits = []
+    for kw in AD_MARKER_KEYWORDS:
+        k = kw.lower()
+        if k and k in d:
+            marker_hits.append(k)
+
+    # Host keyword hits (already tuned for ad-ish hosts)
+    host_hits = []
+    for kw in AD_HOST_KEYWORDS:
+        k = kw.lower()
+        if k and k in d:
+            host_hits.append(k)
+
+    # DGA-ish / cache-bust-ish (signal only)
+    randomish = looks_like_random_subdomain(d)
+
+    if marker_hits:
+        detail = f"markers={','.join(sorted(set(marker_hits)))} qtype={qtype_name}"
+        log_message(f"AD MARKER SIGNAL: {d} ({detail})", color=Fore.MAGENTA)
+        log_ad_insight("AD_MARKER", client_ip, d, detail)
+
+    if host_hits:
+        detail = f"host_keywords={','.join(sorted(set(host_hits)))} qtype={qtype_name}"
+        log_message(f"AD HOST SIGNAL: {d} ({detail})", color=Fore.MAGENTA)
+        log_ad_insight("AD_HOST_SIGNAL", client_ip, d, detail)
+
+    if randomish:
+        detail = f"randomish_subdomain qtype={qtype_name}"
+        log_ad_insight("RANDOMISH_HOST", client_ip, d, detail)
+
+def detect_and_mitigate_ad_injection(request: DNSRecord, parsed_reply: DNSRecord, client_ip: str):
+    """
+    Detect:
+      - CNAME chains pointing into blocked/candidate ad hosts
+      - suspicious wildcard/hijack patterns (log only)
+      - private/special IP answers (log only)
+    Mitigate (optional):
+      - If allowed qname CNAMEs into a blocked/candidate: sink it (AUTO_BLOCK_INJECTED_CNAME)
+    """
+    if not DETECT_AD_INJECTION:
+        return None
+
+    qname = _normalize_domain(str(request.q.qname))
+    qtype = request.q.qtype
+
+    # 1) CNAME injection-ish: allowed host resolves via ad/tracker CNAME
+    cname_targets = _collect_cname_targets(parsed_reply)
+    for t in cname_targets:
+        # Ignore if critical allowlisted (avoid breaking important service chains)
+        if domain_in_set_or_parent(t, allowlist_critical) or domain_in_set_or_parent(t, allowlist):
+            continue
+
+        is_target_blocked = is_blocked(t)
+        is_target_candidate = hostname_is_ad_candidate(t)
+
+        if is_target_blocked or is_target_candidate:
+            kind = "INJECTION_CNAME_BLOCKED" if is_target_blocked else "INJECTION_CNAME_CANDIDATE"
+            detail = f"cname_target={t} qtype={QTYPE.get(qtype, str(qtype))}"
+
+            log_message(f"AD INJECTION SIGNAL: {qname} -> CNAME {t}", color=Fore.MAGENTA)
+            log_ad_insight(kind, client_ip, qname, detail)
+
+            # Keep your existing discovery/catalog logic, but add the CNAME target too
+            if is_target_candidate and not is_target_blocked:
+                try:
+                    catalog_candidate(t)
+                except Exception:
+                    pass
+                try:
+                    add_discovered_domain(t)
+                except Exception:
+                    pass
+
+            if AUTO_BLOCK_INJECTED_CNAME:
+                # Sink the response for A/AAAA/ANY queries (others get an empty NOERROR reply)
+                reply = request.reply()
+                reply.header.rcode = RCODE.NOERROR
+                if qtype in (QTYPE.A, QTYPE.ANY):
+                    reply.add_answer(RR(qname, QTYPE.A, rdata=A(SINK_IPv4), ttl=60))
+                if qtype in (QTYPE.AAAA, QTYPE.ANY):
+                    reply.add_answer(RR(qname, QTYPE.AAAA, rdata=AAAA(SINK_IPv6), ttl=60))
+
+                log_message(f"INJECTION MITIGATED (sunk): {qname} (via {t})", color=Fore.RED)
+                log_ad_insight("INJECTION_SUNK", client_ip, qname, f"via_cname={t}")
+                return reply.pack()
+
+            # If not auto-blocking, we still just log and continue
+            break
+
+    # 2) Wildcard/hijack-ish patterns (log only)
+    ips_with_ttl = _collect_a_aaaa_answers(parsed_reply)
+    _track_possible_wildcard_injection(qname, ips_with_ttl, client_ip)
+
+    # 3) Private/special IP answers (log only; sometimes captive portal / injection)
+    for ip, ttl in ips_with_ttl[:4]:
+        if is_private_or_special_ip(ip):
+            detail = f"special_ip_answer ip={ip} ttl={ttl}"
+            log_ad_insight("SPECIAL_IP_ANSWER", client_ip, qname, detail)
+
+    return None
 
 # ============================
 # FILE IO
@@ -348,7 +661,7 @@ def _tcp_query(query_bytes: bytes):
         log_message(f"TCP failed on {up}: {e}", color=Fore.YELLOW)
         raise
 
-def resolve_query(query_bytes: bytes) -> bytes:
+def resolve_query(query_bytes: bytes, client_ip: str = None) -> bytes:
     try:
         request = DNSRecord.parse(query_bytes)
         qname = _normalize_domain(str(request.q.qname))
@@ -356,11 +669,15 @@ def resolve_query(query_bytes: bytes) -> bytes:
 
         log_message(f"Query received: {qname}", color=Fore.WHITE)
 
+        # --- AD MARKER / SIGNAL DETECTION (log-only) ---
+        detect_ad_markers(client_ip or "unknown", qname, qtype)
+
         if hostname_is_ad_candidate(qname):
             catalog_candidate(qname)
 
         if is_blocked(qname):
             log_message(f"BLOCKED: {qname}", color=Fore.RED)
+            log_ad_insight("BLOCKED", client_ip or "unknown", qname, f"qtype={QTYPE.get(qtype, str(qtype))}")
             reply = request.reply()
             if qtype in (QTYPE.A, QTYPE.ANY):
                 reply.add_answer(RR(qname, QTYPE.A, rdata=A(SINK_IPv4), ttl=60))
@@ -396,8 +713,15 @@ def resolve_query(query_bytes: bytes) -> bytes:
             raise Exception("All upstreams failed")
 
         parsed = DNSRecord.parse(resp)
+
+        # --- AD INJECTION / MARKER DETECTION (and optional mitigation) ---
+        override = detect_and_mitigate_ad_injection(request, parsed, client_ip or "unknown")
+        if override:
+            return override
+
         if hostname_is_ad_candidate(qname) and not is_blocked(qname):
             add_discovered_domain(qname)
+
         cache_put(qname, qtype, parsed)
 
         log_message(f"RESOLVED: {qname}", color=Fore.BLUE)
@@ -445,7 +769,7 @@ def write_current_users_periodically():
 # ============================
 def handle_request(data, addr, sock):
     try:
-        response = resolve_query(data)
+        response = resolve_query(data, client_ip=addr[0])
         if response:
             sock.sendto(response, addr)
             mark_active(addr)
@@ -537,10 +861,12 @@ class DoTServer(threading.Thread):
                     query = _recv_exact(tls, msg_len)
                     if not query:
                         break
-                    response = resolve_query(query)
+                    response = resolve_query(query, client_ip=addr[0])
                     if not response:
                         break
                     tls.sendall(struct.pack("!H", len(response)) + response)
+                    # Track DoT clients in your active user logic too
+                    mark_active(addr)
         except (ssl.SSLError, ConnectionError, socket.timeout):
             pass
         except Exception as e:
