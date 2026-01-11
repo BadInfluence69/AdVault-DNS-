@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 # AdVault DNS — Unified Single-File Resolver (+ DNS-over-TLS) + TCP :53 + UDP worker pool
 # created by: "Brian Cambron" | Github: https://github.com/BadInfluence69/AdVault-DNS-
-# revised: 2026-01-11 (merged safe improvements: TCP :53, UDP workers, clean reload, safer marker matching)
+# revised: 2026-01-11
+# enhancements: unique ad counters + newly added counters + immediate in-memory blocking of discovered domains
 
 import os
 import io
@@ -30,14 +31,14 @@ sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="repla
 sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace")
 init(autoreset=True)
 
-# --- INTERCEPTION SETTINGS ---
-# Set this to the IP of your "Read" server or the local machine for interception
-YOUTUBE_INTERCEPT_IP  = "127.0.0.1" 
+# --- INTERCEPTION SETTINGS (placeholders only; DNS resolver remains DNS-only) ---
+YOUTUBE_INTERCEPT_IP  = "127.0.0.1"
 INTERCEPT_YOUTUBE_ADS = True
-SNI_PROXY_PORT        = 443 # Intercepts HTTPS traffic at the network level
+SNI_PROXY_PORT        = 443
 
 # Regex for YouTube ad-serving subdomains (googlevideo SNI patterns)
-YT_AD_REGEX = re.compile(r"r[0-9]+---sn-[a-z0-9]+\.googlevideo\.com")
+YT_AD_REGEX = re.compile(r"(^|\.)r[0-9]+---sn-[a-z0-9]+\.googlevideo\.com$", re.IGNORECASE)
+
 # ============================
 # SETTINGS
 # ============================
@@ -89,11 +90,20 @@ SAMPLE_MAX_ITEMS_PER_IP    = 200
 SHORT_MARKER_MAXLEN        = 3
 
 # ============================
+# AUTO-EVOLUTION SETTINGS (your request)
+# ============================
+# When we identify an ad candidate domain not already blocked:
+# - add it into discovered_blocklist.txt
+# - add it into in-memory blocklist so it becomes blocked immediately for subsequent queries
+AUTO_ADD_DISCOVERED_TO_BLOCKLIST     = True
+
+# If True, the *same query* that triggered discovery is also sunk immediately.
+# If False, that first query still resolves; next time it is blocked.
+AUTO_BLOCK_DISCOVERED_IMMEDIATELY    = False
+
+# ============================
 # GEO SPOOFING / GEO OVERRIDES (OPT-IN)
 # ============================
-# NOTE:
-# - This is OFF by default.
-# - If you enable it, set GEO_LOOKUP_URL to a REAL URL that returns JSON with {"status":"success","countryCode":"US"} etc.
 GEO_ENABLED        = False
 GEO_LOOKUP_TIMEOUT = 1.2
 GEO_CACHE_TTL      = 24 * 3600
@@ -131,7 +141,8 @@ allowlist_critical = {
     "allow-storage-access-by-user-activation","allow-scripts","accounts.google.com"
 }
 
-AD_HOST_KEYWORDS = [
+# Raw mixed list (strings; some are regex-ish). We'll split into substring list + compiled regex list.
+AD_HOST_KEYWORDS_RAW = [
     r"[0-9]+---sn-[a-z0-9]+\.googlevideo\.com",
     "ad.", ".ad.", "ads.", ".ads.", "adservice", "adserver", "advert", "doubleclick",
     "googlesyndication", "googletagservices", "googletagmanager", "adnxs", "moatads",
@@ -142,6 +153,22 @@ AD_HOST_KEYWORDS = [
     "smartadserver", "adcolony", "chartboost", "fyber", "inmobi", "unityads", "applovin",
     "ironsrc", "tracking", "tracker", "pixel", "beacon", "affiliate", "clk.", "click."
 ]
+
+# Build: substring keywords + regex patterns
+AD_HOST_KEYWORDS = []
+AD_HOST_REGEXES  = [YT_AD_REGEX]
+for kw in AD_HOST_KEYWORDS_RAW:
+    k = (kw or "").strip()
+    if not k:
+        continue
+    # Treat as regex if it clearly looks like a regex pattern (character class or escapes)
+    if ("[" in k) or ("\\" in k) or ("+" in k):
+        try:
+            AD_HOST_REGEXES.append(re.compile(k, re.IGNORECASE))
+        except Exception:
+            AD_HOST_KEYWORDS.append(k.lower())
+    else:
+        AD_HOST_KEYWORDS.append(k.lower())
 
 keyword_blocklist = list(set([
     "scte-35", "banner", "advertisement",
@@ -192,6 +219,7 @@ cache_lock    = threading.Lock()
 
 blocklist  = set()
 allowlist  = set()
+discovered_domains = set()   # NEW: loaded from discovered_file for immediate blocking
 _up_idx    = 0
 dns_cache  = dict()
 
@@ -201,6 +229,15 @@ _insights_lock   = threading.Lock()
 
 _geo_lock  = threading.Lock()
 _geo_cache = {}  # ip -> (exp_epoch, country_code)
+
+# ============================
+# UNIQUE AD STATS (NEW)
+# ============================
+_adstats_lock = threading.Lock()
+_unique_ads_detected = set()              # unique blocked domains encountered (this run)
+_new_ads_added_total = set()              # unique domains auto-added to blocklist (this run)
+_new_ads_added_since_write = set()        # unique domains auto-added since last dashboard write
+
 
 # ============================
 # HELPERS
@@ -537,6 +574,18 @@ def _prune_and_snapshot(now=None):
             }
         return snap
 
+# ============================
+# DASHBOARD WRITER (UPDATED)
+# ============================
+def _snapshot_ad_stats_for_dashboard():
+    with _adstats_lock:
+        total_unique_ads = len(_unique_ads_detected)
+        total_new_added  = len(_new_ads_added_total)
+        new_since_write  = len(_new_ads_added_since_write)
+        # clear per-interval set after snapshot
+        _new_ads_added_since_write.clear()
+    return total_unique_ads, total_new_added, new_since_write
+
 def write_current_users_periodically():
     while not shutdown_event.is_set():
         try:
@@ -545,8 +594,13 @@ def write_current_users_periodically():
             snap = _prune_and_snapshot(now)
             unique_networks = len(snap)
 
+            total_unique_ads, total_new_added, new_since_write = _snapshot_ad_stats_for_dashboard()
+
             lines = []
             lines.append(f"Current unique networks: {unique_networks}")
+            lines.append(f"Total unique ads detected (this run): {total_unique_ads}")
+            lines.append(f"Total newly detected ads added (this run): {total_new_added}")
+            lines.append(f"Newly detected ads added (since last update): {new_since_write}")
             lines.append(f"Updated: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
             lines.append(f"Active window: {USERS_ACTIVE_WINDOW}s  |  Write interval: {USERS_WRITE_INTERVAL}s")
             lines.append("")
@@ -603,10 +657,28 @@ def _keyword_in_domain_with_boundaries(keyword: str, domain: str) -> bool:
         return False
 
     if len(k) <= SHORT_MARKER_MAXLEN:
-        # boundaries: (^|[._-])k($|[._-])
         pat = re.compile(rf"(^|[._-]){re.escape(k)}($|[._-])")
         return bool(pat.search(d))
     return (k in d)
+
+# ============================
+# AD STATS HELPERS (NEW)
+# ============================
+def _record_unique_ad_detected(domain: str):
+    d = _normalize_domain(domain)
+    if not d:
+        return
+    with _adstats_lock:
+        _unique_ads_detected.add(d)
+
+def _record_new_ad_added(domain: str):
+    d = _normalize_domain(domain)
+    if not d:
+        return
+    with _adstats_lock:
+        _new_ads_added_total.add(d)
+        _new_ads_added_since_write.add(d)
+        _unique_ads_detected.add(d)  # also counts as detected
 
 # ============================
 # AD MARKER / INJECTION DETECTION
@@ -624,10 +696,19 @@ def detect_ad_markers(client_ip: str, qname: str, qtype: int):
             marker_hits.append(kw.lower())
 
     host_hits = []
+
+    # substring host indicators
     for kw in AD_HOST_KEYWORDS:
-        k = kw.lower()
-        if k and k in d:
-            host_hits.append(k)
+        if kw and kw in d:
+            host_hits.append(kw)
+
+    # regex host indicators
+    for rx in AD_HOST_REGEXES:
+        try:
+            if rx.search(d):
+                host_hits.append(f"regex:{rx.pattern}")
+        except Exception:
+            pass
 
     randomish = looks_like_random_subdomain(d)
 
@@ -823,18 +904,37 @@ def update_blocklist_preserve():
         log_message(f"Blocklist updated with {len(collected)} domains (no deletions).", color=Fore.GREEN)
 
 def load_lists_into_memory():
-    global blocklist, allowlist
+    global blocklist, allowlist, discovered_domains
     with lists_lock:
         blocklist = load_file_domains(blocklist_file)
         allowlist = load_file_domains(allowlist_file)
-    log_message(f"In-memory lists: block={len(blocklist)} allow={len(allowlist)}", color=Fore.CYAN)
+        discovered_domains = load_file_domains(discovered_file)
+        # Make discovered domains immediately effective even without re-building the huge blocklist file
+        blocklist.update(discovered_domains)
+    log_message(f"In-memory lists: block={len(blocklist)} allow={len(allowlist)} discovered={len(discovered_domains)}", color=Fore.CYAN)
 
 # ============================
 # DISCOVERY
 # ============================
 def hostname_is_ad_candidate(domain: str) -> bool:
     d = _normalize_domain(domain)
-    return any(k in d for k in AD_HOST_KEYWORDS)
+    if not d:
+        return False
+
+    # regex patterns
+    for rx in AD_HOST_REGEXES:
+        try:
+            if rx.search(d):
+                return True
+        except Exception:
+            pass
+
+    # substring patterns
+    for k in AD_HOST_KEYWORDS:
+        if k and k in d:
+            return True
+
+    return False
 
 def catalog_candidate(domain: str):
     d = _normalize_domain(domain)
@@ -855,22 +955,33 @@ def catalog_candidate(domain: str):
             cat[d]["last"] = now
         save_catalog(cat)
 
-def add_discovered_domain(domain: str):
+def add_discovered_domain(domain: str) -> bool:
+    """
+    Returns True if we added a NEW domain (unique) into discovery + effective blocklist.
+    """
     d = _normalize_domain(domain)
     if not is_valid_domain(d):
-        return
+        return False
     if domain_in_set_or_parent(d, allowlist_critical) or domain_in_set_or_parent(d, allowlist):
-        return
-    if d in blocklist:
-        return
+        return False
 
     with discover_lock:
-        current = load_file_domains(discovered_file)
-        if d in current:
-            return
-        current.add(d)
-        save_domains(discovered_file, current)
-        log_message(f"Discovered ad domain added: {d}", color=Fore.MAGENTA)
+        if d in discovered_domains:
+            return False
+        if d in blocklist:
+            return False
+
+        # Persist (append) and update memory
+        discovered_domains.add(d)
+
+        if AUTO_ADD_DISCOVERED_TO_BLOCKLIST:
+            blocklist.add(d)
+
+        append_line(discovered_file, d)
+        _record_new_ad_added(d)
+
+    log_message(f"Discovered ad domain added: {d}", color=Fore.MAGENTA)
+    return True
 
 def is_blocked(domain: str) -> bool:
     d = _normalize_domain(domain)
@@ -971,7 +1082,9 @@ def resolve_query(query_bytes: bytes, client_ip: str = None) -> bytes:
         if hostname_is_ad_candidate(qname):
             catalog_candidate(qname)
 
+        # Normal block path
         if is_blocked(qname):
+            _record_unique_ad_detected(qname)  # unique domain tracking
             log_message(f"BLOCKED: {qname}", color=Fore.RED)
             log_ad_insight("BLOCKED", client_ip or "unknown", qname, f"qtype={QTYPE.get(qtype, str(qtype))}")
             reply = request.reply()
@@ -1022,8 +1135,22 @@ def resolve_query(query_bytes: bytes, client_ip: str = None) -> bytes:
         if override:
             return override
 
+        # ============================
+        # AUTO-EVOLVE: add newly detected ads to blocklist
+        # ============================
         if hostname_is_ad_candidate(qname) and not is_blocked(qname):
-            add_discovered_domain(qname)
+            added = add_discovered_domain(qname)
+            if added and AUTO_BLOCK_DISCOVERED_IMMEDIATELY:
+                _record_unique_ad_detected(qname)
+                reply = request.reply()
+                reply.header.rcode = RCODE.NOERROR
+                if qtype in (QTYPE.A, QTYPE.ANY):
+                    reply.add_answer(RR(qname, QTYPE.A, rdata=A(SINK_IPv4), ttl=60))
+                if qtype in (QTYPE.AAAA, QTYPE.ANY):
+                    reply.add_answer(RR(qname, QTYPE.AAAA, rdata=AAAA(SINK_IPv6), ttl=60))
+                log_message(f"AUTO-BLOCKED (immediate): {qname}", color=Fore.RED)
+                log_ad_insight("AUTO_BLOCK_IMMEDIATE", client_ip or "unknown", qname, f"qtype={QTYPE.get(qtype, str(qtype))}")
+                return reply.pack()
 
         cache_put(qname, qtype, parsed)
 
