@@ -1,33 +1,69 @@
-# AdVault DNS — Unified Single-File Resolver (+ DNS-over-TLS)
+#!/usr/bin/env python3
+# AdVault DNS — Unified Single-File Resolver (+ DNS-over-TLS) + TCP :53 + UDP worker pool
 # created by: "Brian Cambron" | Github: https://github.com/BadInfluence69/AdVault-DNS-
-# revised: 2026-01-07
+# revised: 2026-01-11 (merged safe improvements: TCP :53, UDP workers, clean reload, safer marker matching)
 
-import os, sys, io, re, time, socket, ssl, struct, threading, datetime, tempfile, signal, json
-import ipaddress, math
+import os
+import io
+import re
+import sys
+import ssl
+import json
+import math
+import time
+import socket
+import struct
+import signal
+import tempfile
+import threading
+import datetime
+import ipaddress
 from collections import Counter, deque
-
-sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
-sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace")
+from concurrent.futures import ThreadPoolExecutor
 
 import requests
 from dnslib import DNSRecord, QTYPE, RR, A, AAAA, RCODE
 from colorama import Fore, Style, init
+
+# Make stdout/stderr resilient
+sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
+sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace")
 init(autoreset=True)
 
+# --- INTERCEPTION SETTINGS ---
+# Set this to the IP of your "Read" server or the local machine for interception
+YOUTUBE_INTERCEPT_IP  = "127.0.0.1" 
+INTERCEPT_YOUTUBE_ADS = True
+SNI_PROXY_PORT        = 443 # Intercepts HTTPS traffic at the network level
+
+# Regex for YouTube ad-serving subdomains (googlevideo SNI patterns)
+YT_AD_REGEX = re.compile(r"r[0-9]+---sn-[a-z0-9]+\.googlevideo\.com")
 # ============================
 # SETTINGS
 # ============================
+LISTEN_HOST          = "0.0.0.0"
+DNS_UDP_PORT         = 53
+DNS_TCP_PORT         = 53
+DOT_PORT             = 853
+
+# Concurrency
+UDP_WORKERS          = 200         # ThreadPool max_workers for UDP handler
+TCP_BACKLOG          = 256
+TCP_CLIENT_TIMEOUT   = 8.0
+
+# DoT cert/key
 DOT_CERTFILE = "fullchain.pem"
 DOT_KEYFILE  = "privkey.pem"
-DOT_PORT     = 853
-UPSTREAMS    = [("8.8.8.8", 53)]
-UPSTREAM_TCP_TIMEOUT = 4
-UPSTREAM_UDP_TIMEOUT = 4
-SINK_IPv4    = "0.0.0.0"
-SINK_IPv6    = "::"
 DOT_HOSTNAME = os.environ.get("ADV_DNS_HOSTNAME", "localhost")
 
-# IMPORTANT: Don't set this insanely high on Windows unless you have tons of RAM.
+UPSTREAMS = [("8.8.8.8", 53)]
+UPSTREAM_TCP_TIMEOUT = 4.0
+UPSTREAM_UDP_TIMEOUT = 4.0
+
+SINK_IPv4 = "0.0.0.0"
+SINK_IPv6 = "::"
+
+# IMPORTANT: Don't set insanely high on Windows unless you have tons of RAM.
 CACHE_MAX_ENTRIES = 200000
 CACHE_TTL_CAP     = 3600
 
@@ -43,38 +79,37 @@ USERS_WRITE_INTERVAL = 3      # seconds (how often file is rewritten)
 USERS_ACTIVE_WINDOW  = 3      # seconds (rolling window for "active" + query counts)
 
 # Dashboard / abuse signals (FLAGS ONLY — no blocking by default)
-HOT_QPS_THRESHOLD          = 200.0   # QPS >= this => HOT (likely automation/abuse)
-RANDOMISH_RATIO_THRESHOLD  = 0.50    # >= 50% randomish sample => RANDOMISH
-SAMPLE_EVERY_N_QUERIES     = 25      # sample 1 of every N queries per IP (keeps CPU low under abuse)
-SAMPLE_MAX_ITEMS_PER_IP    = 200     # max sampled qnames stored per IP (approx unique calc)
+HOT_QPS_THRESHOLD          = 200.0
+RANDOMISH_RATIO_THRESHOLD  = 0.50
+SAMPLE_EVERY_N_QUERIES     = 25
+SAMPLE_MAX_ITEMS_PER_IP    = 200
+
+# Short-marker false-positive reducer:
+# Example: "ima" inside "heimaoip.com" should NOT trigger.
+SHORT_MARKER_MAXLEN        = 3
 
 # ============================
 # GEO SPOOFING / GEO OVERRIDES (OPT-IN)
 # ============================
-# This is the "geo spoofing" rebuilt in a way that actually works inside your resolver.
-# It ONLY affects domains you add to GEO_SPOOF_RULES_*.
-#
-# NOTE: GeoIP lookup sends the client IP to a GeoIP service if enabled.
-# For production, use a local GeoIP DB (MaxMind) instead of a public API.
-GEO_ENABLED        = True
+# NOTE:
+# - This is OFF by default.
+# - If you enable it, set GEO_LOOKUP_URL to a REAL URL that returns JSON with {"status":"success","countryCode":"US"} etc.
+GEO_ENABLED        = False
 GEO_LOOKUP_TIMEOUT = 1.2
-GEO_CACHE_TTL      = 24 * 3600  # seconds
-GEO_LOOKUP_URL     = "185.107.97.246"
+GEO_CACHE_TTL      = 24 * 3600
+GEO_LOOKUP_URL     = ""  # e.g. "https://example-geoip/api/{ip}"
 
-# Map: domain -> { "US": "1.1.1.1", "GB": "2.2.2.2", "DEFAULT": "8.8.8.8" }
-# Tip: put a parent domain (example.com) to apply to all subdomains too.
 GEO_SPOOF_RULES_A = {
-    # "yourdomain.com": {"US": "1.1.1.1", "GB": "2.2.2.2", "DEFAULT": "8.8.8.8"},
+    # "example.com": {"US": "1.1.1.1", "DEFAULT": "8.8.8.8"},
 }
-
-# Optional AAAA overrides:
 GEO_SPOOF_RULES_AAAA = {
-    # "yourdomain.com": {"US": "2606:4700:4700::1111", "DEFAULT": "2001:4860:4860::8888"},
+    # "example.com": {"US": "2606:4700:4700::1111", "DEFAULT": "2001:4860:4860::8888"},
 }
-
-# If True, geo overrides happen BEFORE blocklist/upstream resolution.
 GEO_OVERRIDE_PRECEDENCE_BEFORE_BLOCKING = True
 
+# ============================
+# BLOCKLIST SOURCES
+# ============================
 blocklist_urls = [
     "http://127.0.0.1/Advault/dynamic_blocklist.txt",
     "http://127.0.0.1/Advault/discovered_blocklist.txt",
@@ -97,6 +132,7 @@ allowlist_critical = {
 }
 
 AD_HOST_KEYWORDS = [
+    r"[0-9]+---sn-[a-z0-9]+\.googlevideo\.com",
     "ad.", ".ad.", "ads.", ".ads.", "adservice", "adserver", "advert", "doubleclick",
     "googlesyndication", "googletagservices", "googletagmanager", "adnxs", "moatads",
     "taboola", "outbrain", "criteo", "rubiconproject", "serving-sys", "zemanta",
@@ -121,7 +157,7 @@ keyword_blocklist = list(set([
 ]))
 
 # ============================
-# AD DETECTION / INJECTION
+# AD DETECTION / INJECTION (DNS-only signals)
 # ============================
 DETECT_AD_MARKERS         = True
 DETECT_AD_INJECTION       = True
@@ -147,6 +183,8 @@ _injection_ip_stats = {}  # ip -> {"first":ts,"last":ts,"names":set([...])}
 # ============================
 # GLOBAL STATE
 # ============================
+shutdown_event = threading.Event()
+
 discover_lock = threading.Lock()
 lists_lock    = threading.Lock()
 catalog_lock  = threading.Lock()
@@ -157,14 +195,11 @@ allowlist  = set()
 _up_idx    = 0
 dns_cache  = dict()
 
-# Active clients (rolling-window accurate):
-# ip -> state
 _active_clients = {}
 _active_lock     = threading.Lock()
 _insights_lock   = threading.Lock()
 
-# GeoIP cache
-_geo_lock = threading.Lock()
+_geo_lock  = threading.Lock()
 _geo_cache = {}  # ip -> (exp_epoch, country_code)
 
 # ============================
@@ -349,10 +384,6 @@ def _geo_cache_put(ip: str, cc: str):
         _geo_cache[ip] = (time.time() + float(GEO_CACHE_TTL), cc)
 
 def geo_country_for_ip(ip: str) -> str:
-    """
-    Returns countryCode like 'US', 'GB' or 'DEFAULT' on failure.
-    Only called when a GEO override rule matches (so this doesn't run on every query).
-    """
     if not GEO_ENABLED or not ip or ip == "unknown":
         return "DEFAULT"
     if is_private_or_special_ip(ip):
@@ -362,14 +393,15 @@ def geo_country_for_ip(ip: str) -> str:
     if cached:
         return cached
 
+    cc = "DEFAULT"
     try:
+        if not GEO_LOOKUP_URL or "{ip}" not in GEO_LOOKUP_URL:
+            return "DEFAULT"
         url = GEO_LOOKUP_URL.format(ip=ip)
         r = requests.get(url, timeout=float(GEO_LOOKUP_TIMEOUT))
         data = r.json() if r is not None else {}
         if data.get("status") == "success":
             cc = (data.get("countryCode") or "DEFAULT").upper()
-        else:
-            cc = "DEFAULT"
     except Exception:
         cc = "DEFAULT"
 
@@ -377,10 +409,6 @@ def geo_country_for_ip(ip: str) -> str:
     return cc
 
 def _best_geo_rule_match(qname: str, rules_dict: dict):
-    """
-    Finds the most specific key match (exact or parent-suffix match).
-    Example: qname=a.b.example.com matches example.com
-    """
     q = _normalize_domain(qname)
     best = None
     best_len = -1
@@ -392,11 +420,7 @@ def _best_geo_rule_match(qname: str, rules_dict: dict):
                 best_len = len(kk)
     return best
 
-def geo_override_answer(request: DNSRecord, client_ip: str) -> bytes | None:
-    """
-    If qname matches GEO_SPOOF_RULES_A / GEO_SPOOF_RULES_AAAA,
-    return a synthetic answer based on client geo.
-    """
+def geo_override_answer(request: DNSRecord, client_ip: str):
     qname = _normalize_domain(str(request.q.qname))
     qtype = int(request.q.qtype)
 
@@ -427,7 +451,7 @@ def geo_override_answer(request: DNSRecord, client_ip: str) -> bytes | None:
     return None
 
 # ============================
-# ACTIVE USER + CLIENT IP TRACKING (window-accurate)
+# ACTIVE USER + CLIENT IP TRACKING
 # ============================
 def _init_ip_state(now: float, sec: int, W: int):
     return {
@@ -514,7 +538,7 @@ def _prune_and_snapshot(now=None):
         return snap
 
 def write_current_users_periodically():
-    while True:
+    while not shutdown_event.is_set():
         try:
             now = time.time()
             W = max(1, int(USERS_ACTIVE_WINDOW))
@@ -527,8 +551,6 @@ def write_current_users_periodically():
             lines.append(f"Active window: {USERS_ACTIVE_WINDOW}s  |  Write interval: {USERS_WRITE_INTERVAL}s")
             lines.append("")
             lines.append(f"Active client IPs (last {USERS_ACTIVE_WINDOW}s):")
-
-            # Optional table header (comment out if you want the simpler look)
             lines.append("IP\tq\tqps\trand%\tuniq~\tseen\tflags")
 
             def _sort_key(item):
@@ -567,6 +589,26 @@ def write_current_users_periodically():
         time.sleep(USERS_WRITE_INTERVAL)
 
 # ============================
+# MARKER MATCHING (safer)
+# ============================
+def _keyword_in_domain_with_boundaries(keyword: str, domain: str) -> bool:
+    """
+    Safer matching for short tokens like 'ima' so we don't false-positive on 'heimaoip.com'.
+    - For very short keywords (<= SHORT_MARKER_MAXLEN), require boundary separators: start/end, dot, dash, underscore.
+    - For longer keywords, allow substring match.
+    """
+    k = (keyword or "").lower().strip()
+    d = _normalize_domain(domain)
+    if not k or not d:
+        return False
+
+    if len(k) <= SHORT_MARKER_MAXLEN:
+        # boundaries: (^|[._-])k($|[._-])
+        pat = re.compile(rf"(^|[._-]){re.escape(k)}($|[._-])")
+        return bool(pat.search(d))
+    return (k in d)
+
+# ============================
 # AD MARKER / INJECTION DETECTION
 # ============================
 def detect_ad_markers(client_ip: str, qname: str, qtype: int):
@@ -578,9 +620,8 @@ def detect_ad_markers(client_ip: str, qname: str, qtype: int):
 
     marker_hits = []
     for kw in AD_MARKER_KEYWORDS:
-        k = kw.lower()
-        if k and k in d:
-            marker_hits.append(k)
+        if _keyword_in_domain_with_boundaries(kw, d):
+            marker_hits.append(kw.lower())
 
     host_hits = []
     for kw in AD_HOST_KEYWORDS:
@@ -611,7 +652,6 @@ def detect_and_mitigate_ad_injection(request: DNSRecord, parsed_reply: DNSRecord
     qname = _normalize_domain(str(request.q.qname))
     qtype = request.q.qtype
 
-    # 1) CNAME injection-ish: allowed host resolves via ad/tracker CNAME
     cname_targets = _collect_cname_targets(parsed_reply)
     for t in cname_targets:
         if domain_in_set_or_parent(t, allowlist_critical) or domain_in_set_or_parent(t, allowlist):
@@ -650,11 +690,9 @@ def detect_and_mitigate_ad_injection(request: DNSRecord, parsed_reply: DNSRecord
                 return reply.pack()
             break
 
-    # 2) Wildcard/hijack-ish patterns (log only)
     ips_with_ttl = _collect_a_aaaa_answers(parsed_reply)
     _track_possible_wildcard_injection(qname, ips_with_ttl, client_ip)
 
-    # 3) Private/special IP answers (log only)
     for ip, ttl in ips_with_ttl[:4]:
         if is_private_or_special_ip(ip):
             detail = f"special_ip_answer ip={ip} ttl={ttl}"
@@ -726,19 +764,20 @@ def parse_blocklist(raw_data: str):
     domains = set()
     for line in raw_data.splitlines():
         line = line.strip()
-        if not line or line.startswith("#"):
+        if not line:
+            continue
+        if line.startswith("#") or line.startswith("!") or line.startswith("["):
             continue
 
         domain = ""
 
-        # hosts format: "0.0.0.0 example.com" / "127.0.0.1 example.com"
         if line[0].isdigit() and (" " in line) and not line.startswith("||"):
             parts = line.split()
             if len(parts) >= 2:
                 domain = parts[1]
 
-        elif "||" in line:
-            domain = line.split("||", 1)[1].split("^", 1)[0]
+        elif line.startswith("||"):
+            domain = line[2:].split("^", 1)[0].strip()
 
         elif "$" in line:
             m = re.search(r"domain=([a-zA-Z0-9.-]+)", line)
@@ -840,7 +879,7 @@ def is_blocked(domain: str) -> bool:
     if d in blocklist:
         return True
     for kw in keyword_blocklist:
-        if kw in d:
+        if kw and kw in d:
             return True
     return False
 
@@ -919,17 +958,14 @@ def resolve_query(query_bytes: bytes, client_ip: str = None) -> bytes:
         qname = _normalize_domain(str(request.q.qname))
         qtype = request.q.qtype
 
-        # Track client IPs + rolling-window counts
         mark_active_ip(client_ip or "unknown", qname)
 
-        # (Optional) Geo override BEFORE everything else
         if GEO_OVERRIDE_PRECEDENCE_BEFORE_BLOCKING:
             geo_resp = geo_override_answer(request, client_ip or "unknown")
             if geo_resp:
                 return geo_resp
 
         log_message(f"Query received: {qname}", color=Fore.WHITE)
-
         detect_ad_markers(client_ip or "unknown", qname, qtype)
 
         if hostname_is_ad_candidate(qname):
@@ -947,7 +983,6 @@ def resolve_query(query_bytes: bytes, client_ip: str = None) -> bytes:
         else:
             log_message(f"ALLOWED: {qname}", color=Fore.GREEN)
 
-        # (Optional) Geo override AFTER blocking check (rare use-case)
         if not GEO_OVERRIDE_PRECEDENCE_BEFORE_BLOCKING:
             geo_resp = geo_override_answer(request, client_ip or "unknown")
             if geo_resp:
@@ -1006,42 +1041,109 @@ def resolve_query(query_bytes: bytes, client_ip: str = None) -> bytes:
             return b""
 
 # ============================
-# UDP SERVER
+# DNS SERVERS
 # ============================
-def handle_request(data, addr, sock):
+def _udp_handle_one(sock, data, addr):
     try:
         response = resolve_query(data, client_ip=addr[0])
         if response:
             sock.sendto(response, addr)
     except Exception as e:
-        log_message(f"Error handling request: {e}", color=Fore.RED)
+        log_message(f"UDP handle error: {e}", color=Fore.YELLOW)
 
-def start_udp_server(host="0.0.0.0", port=53):
-    log_message(f"Starting DNS (UDP) on {host}:{port}", color=Fore.CYAN)
-    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
-        try:
-            sock.bind((host, port))
-        except PermissionError:
-            log_message("Permission denied! Use port > 1024 or run as admin.", color=Fore.RED)
-            return
+def start_udp_server(host=LISTEN_HOST, port=DNS_UDP_PORT, workers=UDP_WORKERS):
+    log_message(f"Starting DNS (UDP) on {host}:{port} | workers={workers}", color=Fore.CYAN)
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        sock.bind((host, port))
+    except PermissionError:
+        log_message("Permission denied! Use port > 1024 or run as admin.", color=Fore.RED)
+        sock.close()
+        return
 
-        while True:
+    with ThreadPoolExecutor(max_workers=int(workers)) as pool:
+        sock.settimeout(0.5)
+        while not shutdown_event.is_set():
             try:
                 data, addr = sock.recvfrom(65535)
-                handle_request(data, addr, sock)
-            except KeyboardInterrupt:
-                break
+                pool.submit(_udp_handle_one, sock, data, addr)
+            except socket.timeout:
+                continue
             except Exception as e:
-                log_message(f"Non-fatal loop error: {e}", color=Fore.YELLOW)
-                time.sleep(0.2)
+                log_message(f"UDP loop error: {e}", color=Fore.YELLOW)
+                time.sleep(0.1)
 
+    try:
+        sock.close()
+    except Exception:
+        pass
     log_message("Shutting down UDP DNS.", color=Fore.CYAN)
+
+def _tcp_client_loop(client_sock, addr):
+    try:
+        client_sock.settimeout(TCP_CLIENT_TIMEOUT)
+        while not shutdown_event.is_set():
+            lp = _recv_exact(client_sock, 2)
+            if not lp:
+                break
+            (msg_len,) = struct.unpack("!H", lp)
+            if msg_len <= 0 or msg_len > 65535:
+                break
+            query = _recv_exact(client_sock, msg_len)
+            if not query:
+                break
+            response = resolve_query(query, client_ip=addr[0])
+            if not response:
+                break
+            client_sock.sendall(struct.pack("!H", len(response)) + response)
+    except socket.timeout:
+        pass
+    except Exception as e:
+        log_message(f"TCP client error {addr}: {e}", color=Fore.YELLOW)
+    finally:
+        try:
+            client_sock.close()
+        except Exception:
+            pass
+
+def start_tcp_server(host=LISTEN_HOST, port=DNS_TCP_PORT):
+    log_message(f"Starting DNS (TCP) on {host}:{port}", color=Fore.CYAN)
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+        srv.bind((host, port))
+        srv.listen(TCP_BACKLOG)
+        srv.settimeout(1.0)
+    except PermissionError:
+        log_message("Permission denied for TCP :53! Run as admin.", color=Fore.RED)
+        srv.close()
+        return
+    except Exception as e:
+        log_message(f"TCP bind/listen failed: {e}", color=Fore.RED)
+        srv.close()
+        return
+
+    try:
+        while not shutdown_event.is_set():
+            try:
+                client, addr = srv.accept()
+                threading.Thread(target=_tcp_client_loop, args=(client, addr), daemon=True).start()
+            except socket.timeout:
+                continue
+            except Exception as e:
+                log_message(f"TCP accept error: {e}", color=Fore.YELLOW)
+    finally:
+        try:
+            srv.close()
+        except Exception:
+            pass
+        log_message("Shutting down TCP DNS.", color=Fore.CYAN)
 
 # ============================
 # DoT SERVER
 # ============================
 class DoTServer(threading.Thread):
-    def __init__(self, host="0.0.0.0", port=DOT_PORT, certfile=DOT_CERTFILE, keyfile=DOT_KEYFILE,
+    def __init__(self, host=LISTEN_HOST, port=DOT_PORT, certfile=DOT_CERTFILE, keyfile=DOT_KEYFILE,
                  tls_min_version=ssl.TLSVersion.TLSv1_2, ciphers=None, client_timeout=30.0, backlog=200):
         super().__init__(daemon=True)
         self.host = host
@@ -1066,12 +1168,15 @@ class DoTServer(threading.Thread):
         base.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         base.bind((self.host, self.port))
         base.listen(self.backlog)
+        base.settimeout(1.0)
         self._sock = base
-        log_message(f"Starting DNS-over-TLS (TCP) on {self.host}:{self.port}", color=Fore.CYAN)
+        log_message(f"Starting DNS-over-TLS (TCP+TLS) on {self.host}:{self.port}", color=Fore.CYAN)
         try:
-            while not self._shutdown.is_set():
+            while not self._shutdown.is_set() and not shutdown_event.is_set():
                 try:
                     client, addr = base.accept()
+                except socket.timeout:
+                    continue
                 except OSError:
                     break
                 threading.Thread(target=self.handle_client, args=(client, addr), daemon=True).start()
@@ -1093,7 +1198,7 @@ class DoTServer(threading.Thread):
         try:
             client_sock.settimeout(self.client_timeout)
             with self.ctx.wrap_socket(client_sock, server_side=True) as tls:
-                while True:
+                while not shutdown_event.is_set():
                     lp = _recv_exact(tls, 2)
                     if not lp:
                         break
@@ -1118,10 +1223,10 @@ class DoTServer(threading.Thread):
                 pass
 
 # ============================
-# SIGNAL HANDLERS (reload)
+# RELOAD / SIGNALS
 # ============================
-def handle_sighup(signum, frame):
-    log_message("SIGHUP received: reloading lists...", color=Fore.CYAN)
+def reload_all_lists(reason="signal"):
+    log_message(f"Reload requested ({reason}): compact + update + load", color=Fore.CYAN)
     try:
         compact_discovered_blocklist()
         update_blocklist_preserve()
@@ -1129,8 +1234,25 @@ def handle_sighup(signum, frame):
     except Exception as e:
         log_message(f"Reload failed: {e}", color=Fore.RED)
 
+def _handle_stop_signal(signum, frame):
+    shutdown_event.set()
+    log_message(f"Shutdown signal received: {signum}", color=Fore.YELLOW)
+
+def _handle_reload_signal(signum, frame):
+    reload_all_lists(reason=f"signal {signum}")
+
+# POSIX
 if hasattr(signal, "SIGHUP"):
-    signal.signal(signal.SIGHUP, handle_sighup)
+    signal.signal(signal.SIGHUP, _handle_reload_signal)
+
+# Windows-friendly reload hook (CTRL+BREAK)
+if hasattr(signal, "SIGBREAK"):
+    signal.signal(signal.SIGBREAK, _handle_reload_signal)
+
+# Stop signals
+for sig_name in ("SIGINT", "SIGTERM"):
+    if hasattr(signal, sig_name):
+        signal.signal(getattr(signal, sig_name), _handle_stop_signal)
 
 # ============================
 # MAIN
@@ -1142,6 +1264,8 @@ if __name__ == "__main__":
         update_blocklist_preserve()
         load_lists_into_memory()
 
+        # Start DoT
+        dot = None
         try:
             dot = DoTServer()
             dot.start()
@@ -1149,10 +1273,18 @@ if __name__ == "__main__":
         except Exception as e:
             log_message(f"DoT disabled (TLS init failed): {e}", color=Fore.YELLOW)
 
+        # Dashboard writer
         threading.Thread(target=write_current_users_periodically, daemon=True).start()
+
+        # Plain TCP :53
+        threading.Thread(target=start_tcp_server, daemon=True).start()
+
+        # UDP :53 (main loop)
         start_udp_server()
 
     except KeyboardInterrupt:
+        shutdown_event.set()
         log_message("Shutting down.", color=Fore.CYAN)
     except Exception as e:
+        shutdown_event.set()
         log_message(f"FATAL ERROR: {e}", color=Fore.RED)
