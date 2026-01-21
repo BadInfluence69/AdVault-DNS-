@@ -1,3 +1,4 @@
+# python DNS_Ad_Blocker.py
 #!/usr/bin/env python3
 # AdVault DNS — Unified Single-File Resolver (+ DNS-over-TLS) + TCP :53 + UDP worker pool
 # created by: "Brian Cambron" | Github: https://github.com/BadInfluence69/AdVault-DNS-
