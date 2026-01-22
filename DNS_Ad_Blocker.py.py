@@ -123,6 +123,7 @@ GEO_OVERRIDE_PRECEDENCE_BEFORE_BLOCKING = True
 # ============================
 blocklist_urls = [
     "http://127.0.0.1/Advault/dynamic_blocklist.txt",
+    "http://127.0.0.1/Advault/dynamic_blocklist_bk.txt",  # bkup list
     "http://127.0.0.1/Advault/discovered_blocklist.txt",
     "https://easylist.to/easylist/easylist.txt",
     "https://easylist.to/easylist/easyprivacy.txt",
