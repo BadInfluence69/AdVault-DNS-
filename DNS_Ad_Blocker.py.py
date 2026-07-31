@@ -1,18 +1,5 @@
 # python DNS_Ad_Blocker.py
-
 # ipconfig /flushdns
-
-#!/usr/bin/env python3
-# created by: "Brian Cambron" | Github: https://github.com/BadInfluence69/AdVault-DNS-
-# revised: 2026-05-05
-# enhancements:
-#   - Rich colorama terminal UI (banner, color-coded events, live stats)
-#   - DNS-over-HTTPS (DoH) upstream support (Google / Cloudflare)
-#   - Weighted multi-signal ad candidate scoring (replaces simple keyword OR)
-#   - Per-event color coding for every log category
-#   - Live terminal stats ticker (prints to console every N seconds)
-#   - All original features preserved: DoT, TCP/UDP :53, auto-evolve blocklist,
-#     injection detection, wildcard tracking, geo overrides, unique ad counters
 
 import os
 import io
@@ -29,7 +16,7 @@ import tempfile
 import threading
 import datetime
 import ipaddress
-from collections import Counter, deque
+from collections import defaultdict, deque, Counter
 from concurrent.futures import ThreadPoolExecutor
 
 import requests
@@ -58,6 +45,7 @@ C = {
     # DNS events
     "BLOCKED"   : Fore.RED,
     "ALLOWED"   : Fore.GREEN,
+    "IP_DENIED" : Back.RED + Fore.WHITE + Style.BRIGHT,
     "RESOLVED"  : Fore.BLUE,
     "CACHE_HIT" : Fore.CYAN,
     "QUERY"     : Fore.WHITE + Style.DIM,
@@ -73,6 +61,9 @@ C = {
     "STAT_VAL"  : Fore.YELLOW + Style.BRIGHT,
     "STAT_GOOD" : Fore.GREEN  + Style.BRIGHT,
     "STAT_BAD"  : Fore.RED    + Style.BRIGHT,
+    # SSAI / Manifest manipulation (new)
+    "SSAI"      : Fore.RED    + Style.BRIGHT,
+    "MANIFEST"  : Fore.YELLOW + Style.BRIGHT,
 }
 
 def _c(key: str) -> str:
@@ -83,15 +74,15 @@ def _c(key: str) -> str:
 # ══════════════════════════════════════════════════════════════════════════════
 BANNER = f"""
 {_c('BANNER')}╔══════════════════════════════════════════════════════════════╗
-║          AdVault DNS  —  Ad-Blocking Resolver v2.0           ║
-║      DoT + DoH upstream + Auto-Evolve + Injection Guard      ║
+║          AdVault DNS  —  Ad-Blocking Resolver v3.0           ║
+║   DoT + DoH + Auto-Evolve + Injection Guard + SSAI Shield    ║
 ║   github.com/BadInfluence69/AdVault-DNS-  |  Brian Cambron   ║
 ╚══════════════════════════════════════════════════════════════╝{_c('RESET')}"""
 
 # ══════════════════════════════════════════════════════════════════════════════
 # INTERCEPTION STUBS  (DNS-only; SNI proxy not implemented here)
 # ══════════════════════════════════════════════════════════════════════════════
-YOUTUBE_INTERCEPT_IP  = "127.0.0.1"
+YOUTUBE_INTERCEPT_IP  = "185.107.97.246"
 INTERCEPT_YOUTUBE_ADS = True
 SNI_PROXY_PORT        = 443
 
@@ -107,36 +98,187 @@ DNS_UDP_PORT      = 53
 DNS_TCP_PORT      = 53
 DOT_PORT          = 853
 
-UDP_WORKERS       = 200
+UDP_WORKERS       = 500
 TCP_BACKLOG       = 256
-TCP_CLIENT_TIMEOUT = 8.0
+TCP_CLIENT_TIMEOUT = 5.0
 
 DOT_CERTFILE = "fullchain.pem"
 DOT_KEYFILE  = "privkey.pem"
 DOT_HOSTNAME = os.environ.get("ADV_DNS_HOSTNAME", "localhost")
 
-# Plain UDP/TCP upstreams (fallback)
-UPSTREAMS = [("8.8.8.8", 53), ("1.1.1.1", 53)]
-UPSTREAM_TCP_TIMEOUT = 4.0
-UPSTREAM_UDP_TIMEOUT = 4.0
+# ══════════════════════════════════════════════════════════════════════════════
+# AUTO-GENERATE TLS KEYS / CERTIFICATE  (if missing)
+# ══════════════════════════════════════════════════════════════════════════════
+def _resolve_dot_paths():
+    """Return absolute paths for cert/key relative to this script's directory."""
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    cert = os.path.join(script_dir, DOT_CERTFILE)
+    key  = os.path.join(script_dir, DOT_KEYFILE)
+    return cert, key
 
-# ── DNS-over-HTTPS upstream (NEW) ────────────────────────────────────────────
-# Queries to upstream are sent as DoH (RFC 8484 application/dns-message)
-# before falling back to plain UDP/TCP.
+def auto_generate_dot_certificates():
+    """
+    Auto-generate a self-signed RSA-2048 TLS certificate + private key
+    in the same folder as this script if either file is missing.
+
+    Uses only the Python standard library (ssl + subprocess via openssl)
+    with a pure-Python fallback using the `cryptography` package when
+    available.  The files written match DOT_CERTFILE / DOT_KEYFILE exactly.
+    """
+    cert_path, key_path = _resolve_dot_paths()
+
+    if os.path.exists(cert_path) and os.path.exists(key_path):
+        return  # nothing to do
+
+    print(f"\n[AdVault DNS] TLS key/cert not found — auto-generating …")
+    print(f"  cert → {cert_path}")
+    print(f"  key  → {key_path}\n")
+
+    # ── Strategy 1: use the `cryptography` package (preferred) ───────────────
+    try:
+        from cryptography import x509
+        from cryptography.x509.oid import NameOID
+        from cryptography.hazmat.primitives import hashes, serialization
+        from cryptography.hazmat.primitives.asymmetric import rsa
+        import datetime as _dt
+
+        # Generate RSA-2048 private key
+        private_key = rsa.generate_private_key(
+            public_exponent=65537,
+            key_size=2048,
+        )
+
+        # Build self-signed certificate
+        subject = issuer = x509.Name([
+            x509.NameAttribute(NameOID.COUNTRY_NAME,             "US"),
+            x509.NameAttribute(NameOID.STATE_OR_PROVINCE_NAME,   "Local"),
+            x509.NameAttribute(NameOID.LOCALITY_NAME,            "AdVault"),
+            x509.NameAttribute(NameOID.ORGANIZATION_NAME,        "AdVault DNS"),
+            x509.NameAttribute(NameOID.COMMON_NAME,              DOT_HOSTNAME),
+        ])
+
+        now = _dt.datetime.now(_dt.timezone.utc)
+        cert = (
+            x509.CertificateBuilder()
+            .subject_name(subject)
+            .issuer_name(issuer)
+            .public_key(private_key.public_key())
+            .serial_number(x509.random_serial_number())
+            .not_valid_before(now)
+            .not_valid_after(now + _dt.timedelta(days=3650))   # 10-year cert
+            .add_extension(
+                x509.SubjectAlternativeName([
+                    x509.DNSName(DOT_HOSTNAME),
+                    x509.DNSName("localhost"),
+                    x509.IPAddress(__import__("ipaddress").IPv4Address("127.0.0.1")),
+                ]),
+                critical=False,
+            )
+            .add_extension(
+                x509.BasicConstraints(ca=False, path_length=None),
+                critical=True,
+            )
+            .sign(private_key, hashes.SHA256())
+        )
+
+        # Write private key (PEM, no passphrase)
+        with open(key_path, "wb") as f:
+            f.write(private_key.private_bytes(
+                encoding=serialization.Encoding.PEM,
+                format=serialization.PrivateFormat.TraditionalOpenSSL,
+                encryption_algorithm=serialization.NoEncryption(),
+            ))
+
+        # Write certificate chain (single self-signed cert)
+        with open(cert_path, "wb") as f:
+            f.write(cert.public_bytes(serialization.Encoding.PEM))
+
+        print("[AdVault DNS] ✔  TLS certificate generated via `cryptography` package.")
+        print(f"              CN={DOT_HOSTNAME}  valid 10 years\n")
+        return
+
+    except ImportError:
+        pass  # fall through to openssl subprocess strategy
+    except Exception as e:
+        print(f"[AdVault DNS] WARN: cryptography-based cert gen failed: {e}")
+
+    # ── Strategy 2: shell out to openssl (available on most systems) ──────────
+    try:
+        import subprocess, shutil
+
+        openssl_bin = shutil.which("openssl")
+        if not openssl_bin:
+            raise FileNotFoundError("openssl binary not found in PATH")
+
+        subj = (
+            f"/C=US/ST=Local/L=AdVault/O=AdVaultDNS"
+            f"/CN={DOT_HOSTNAME}"
+        )
+        san_ext = (
+            f"subjectAltName=DNS:{DOT_HOSTNAME},"
+            f"IP:185.107.97.246"
+        )
+
+        cmd = [
+            openssl_bin, "req", "-x509", "-newkey", "rsa:2048",
+            "-keyout", key_path,
+            "-out",    cert_path,
+            "-days",   "3650",
+            "-nodes",
+            "-subj",   subj,
+            "-addext", san_ext,
+        ]
+
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+        if result.returncode == 0 and os.path.exists(cert_path) and os.path.exists(key_path):
+            print("[AdVault DNS] ✔  TLS certificate generated via openssl CLI.")
+            print(f"              CN={DOT_HOSTNAME}  valid 10 years\n")
+            return
+        else:
+            print(f"[AdVault DNS] WARN: openssl returned {result.returncode}: {result.stderr.strip()}")
+
+    except Exception as e:
+        print(f"[AdVault DNS] WARN: openssl-based cert gen failed: {e}")
+
+    # ── Strategy 3: pure Python using only stdlib ssl + tempfile ─────────────
+    print(
+        "[AdVault DNS] ERROR: Could not auto-generate TLS certificates.\n"
+        "  Please install the `cryptography` package:  pip install cryptography\n"
+        "  OR place your own fullchain.pem / privkey.pem next to this script.\n"
+        "  DNS-over-TLS (port 853) will be DISABLED until certificates exist.\n"
+    )
+
+# Plain UDP/TCP upstreams (fallback)
+UPSTREAMS = [("185.222.222.222", 53)]
+UPSTREAM_TCP_TIMEOUT = 5.0
+UPSTREAM_UDP_TIMEOUT = 5.0
+
+# ── DNS-over-HTTPS upstream ───────────────────────────────────────────────────
 DOH_ENABLED  = True
-DOH_TIMEOUT  = 4.0
+DOH_TIMEOUT  = 5.0
 DOH_UPSTREAMS = [
-    "https://dns.google/dns-query",
-    "https://cloudflare-dns.com/dns-query",
+    "https://8.8.8.8/dns-query",
 ]
 _doh_idx      = 0
 _doh_idx_lock = threading.Lock()
 
-SINK_IPv4 = "0.0.0.0"
-SINK_IPv6 = "::"
+# ── Sinkhole IPs ──────────────────────────────────────────────────────────────
+# IPv4 sinkhole for blocked domains.
+# IPv6 intentionally set to an IPv4 address — this is deliberate: it causes
+# AAAA lookups for blocked domains to fail cleanly, preventing ad networks
+# from using IPv6 as a backdoor or backup delivery path around the sinkhole.
+SINK_IPv4 = "107.149.207.104"
+SINK_IPv6 = "::"   # unspecified address — makes AAAA lookups for blocked domains fail cleanly
 
-CACHE_MAX_ENTRIES = 200_000
-CACHE_TTL_CAP     = 3600
+
+CACHE_MAX_ENTRIES = 60
+CACHE_TTL_CAP     = 15
 
 # ── File paths ────────────────────────────────────────────────────────────────
 blocklist_file  = "dynamic_blocklist.txt"
@@ -145,13 +287,19 @@ discovered_file = "discovered_blocklist.txt"
 ad_insights_log = "ad_insights.txt"
 catalog_file    = "candidates_catalog.json"
 
+# ── Client IP allowlist (access control) ───────────────────────────────────────
+# Only clients whose source IP appears in this file are permitted to use the
+# DNS service. Everyone else is rejected before their query is ever resolved.
+IP_ALLOWLIST_ENABLED = True
+IP_ALLOWLIST_FILE    = "allowed_ips.txt"
+
 # ── Dashboard / users file ────────────────────────────────────────────────────
 USERS_FILE           = "current_users.txt"
-USERS_WRITE_INTERVAL = 3      # seconds between file rewrites
-USERS_ACTIVE_WINDOW  = 3      # rolling window for active-client counts
+USERS_WRITE_INTERVAL = 5      # seconds between file rewrites
+USERS_ACTIVE_WINDOW  = 5      # rolling window for active-client counts
 
-# ── Live terminal stats ticker (NEW) ─────────────────────────────────────────
-TERMINAL_STATS_INTERVAL = 30   # print a colored stats line to console every N seconds
+# ── Live terminal stats ticker ────────────────────────────────────────────────
+TERMINAL_STATS_INTERVAL = 15   # print a colored stats line to console every N seconds
 TERMINAL_STATS_ENABLED  = True
 
 # ── Abuse / anomaly thresholds (flags only — no auto-block by default) ────────
@@ -160,17 +308,16 @@ RANDOMISH_RATIO_THRESHOLD = 0.50
 SAMPLE_EVERY_N_QUERIES    = 25
 SAMPLE_MAX_ITEMS_PER_IP   = 200
 
-SHORT_MARKER_MAXLEN = 3
+SHORT_MARKER_MAXLEN = 5
 
 # ══════════════════════════════════════════════════════════════════════════════
 # AUTO-EVOLVE SETTINGS
 # ══════════════════════════════════════════════════════════════════════════════
 AUTO_ADD_DISCOVERED_TO_BLOCKLIST  = True
-AUTO_BLOCK_DISCOVERED_IMMEDIATELY = False   # sink the *first* triggering query too
+AUTO_BLOCK_DISCOVERED_IMMEDIATELY = True   # sink the *first* triggering query too
 
-# ── Weighted candidate scoring (NEW) ─────────────────────────────────────────
+# ── Weighted candidate scoring ────────────────────────────────────────────────
 # A domain is flagged as an ad candidate when its score >= threshold.
-# Each signal contributes its weight; multiple hits accumulate.
 AD_CANDIDATE_SCORE_THRESHOLD = 2.0
 
 AD_SIGNAL_WEIGHTS = {
@@ -179,16 +326,18 @@ AD_SIGNAL_WEIGHTS = {
     "marker_keyword" : 1.5,   # AD_MARKER_KEYWORDS hit
     "randomish"      : 1.0,   # high-entropy random-looking subdomain
     "tld_suspicious" : 0.5,   # e.g. .xyz, .click, .bid, .loan
+    "ssai_signal"    : 3.0,   # SSAI / manifest-manipulation hostname match (new)
 }
-AD_SUSPICIOUS_TLDS = {".xyz", ".click", ".bid", ".loan", ".win", ".top", ".men", ".date"}
+AD_SUSPICIOUS_TLDS = {".xyz", ".click", ".bid", ".loan", ".win", ".top", ".men", ".dev", ".date"}
 
 # ══════════════════════════════════════════════════════════════════════════════
 # GEO SPOOFING / OVERRIDES  (opt-in)
 # ══════════════════════════════════════════════════════════════════════════════
-GEO_ENABLED        = False
-GEO_LOOKUP_TIMEOUT = 1.2
-GEO_CACHE_TTL      = 24 * 3600
-GEO_LOOKUP_URL     = ""   # e.g. "https://example-geoip/api/{ip}"
+GEO_ENABLED        = True
+GEO_LOOKUP_TIMEOUT = 15
+GEO_CACHE_TTL      = 24 * 15
+GEO_LOOKUP_URL     = "https://107.149.207.104/{ip}"
+# e.g. "https://example-geoip/api/{ip}"
 
 GEO_SPOOF_RULES_A    = {}
 GEO_SPOOF_RULES_AAAA = {}
@@ -198,31 +347,35 @@ GEO_OVERRIDE_PRECEDENCE_BEFORE_BLOCKING = True
 # BLOCKLIST SOURCES
 # ══════════════════════════════════════════════════════════════════════════════
 blocklist_urls = [
-    "http://127.0.0.1/Advault/dynamic_blocklist.txt",
-    "http://127.0.0.1/Advault/dynamic_blocklist_bk.txt",
-    "http://127.0.0.1/Advault/discovered_blocklist.txt",
-    "https://easylist.to/easylist/easylist.txt",
-    "https://easylist.to/easylist/easyprivacy.txt",
-    "https://pgl.yoyo.org/adservers/serverlist.php?hostformat=hosts&showintro=0&mimetype=plaintext",
-    "https://filters.adtidy.org/extension/chromium/filters/2.txt",
-    "https://filters.adtidy.org/extension/chromium/filters/3.txt",
-    "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/adblock/pro.txt",
-    "https://big.oisd.nl/",
-    "https://badmojr.github.io/1Hosts/Lite/domains.txt",
-    "https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts",
+    "http://72.51.249.70/123/dynamic_blocklist.txt",
 ]
 
 allowlist_critical = {
-    "youtube.com", "ytimg.com", "pirateproxy-bay.com",
-    "i.ytimg.com", "s.ytimg.com", "lh3.googleusercontent.com",
-    "yt3.ggpht.com", "youtubei.googleapis.com", "chart.js", "advault",
-    "tv.youtube.com", "ytp-player-content", "ytp-iv-player-content",
-    "allow-storage-access-by-user-activation", "allow-scripts",
-    "accounts.google.com",
+    "youtube.com", "www.youtube.com", "m.youtube.com",
+    "ytimg.com", "i.ytimg.com", "s.ytimg.com", "yt3.ggpht.com",
+    "googlevideo.com", "*.googlevideo.com", "ggpht.com", "*.ggpht.com",
+    "googleusercontent.com", "lh3.googleusercontent.com",
+    "googleapis.com", "youtubei.googleapis.com", "update.googleapis.com",
+    "gstatic.com", "www.gstatic.com", "check.gstatic.com", "connectivity-check.gstatic.com",
+    "accounts.google.com", "apis.google.com", "s.youtube.com", "video.google.com",
+    "youtube-ui.l.google.com", "tv.youtube.com", "chart.js"
 }
 
 # ── Ad host keyword list ──────────────────────────────────────────────────────
 AD_HOST_KEYWORDS_RAW = [
+    r"origin-trial",
+    r"EXT-X-CUE-OUT",
+    r"SCTE-35",
+    r"SCT-35",
+    r"SCT-35.manifest",
+    r"manifest",
+    r"manifestmpd",
+    r"manifest.kson",
+    r"ApvK67ociHgr2egd6c2ZjrfPuRs8BHcvSggogIOPQNH7GJ3cVlyJ1NOq/COCdj0+zxskqHt9HgLLETc8qqD+vwsAAABteyJvcmlnaW4iOiJodHRwczovL3lvdXR1YmUuY29tOjQ0MyIsImZlYXR1cmUiOiJQcml2YWN5U2FuZGJveEFkc0FQSXMiLCJleHBpcnkiOjE2OTUxNjc5OTksImlzU3ViZG9tYWluIjp0cnVlfQ==",
+    r"r3---sn-4g57kn6z.googlevideo.com",
+    r"r1---sn-4g57kn7z.googlevideo.com",
+    r"r5---sn-8xg7en7z.googlevideo.com",
+    r"[0-9]+[a-z0-9]+\.hbomax\.com",
     r"[0-9]+---sn-[a-z0-9]+\.googlevideo\.com",
     "ad.", ".ad.", "ads.", ".ads.", "adservice", "adserver", "advert",
     "doubleclick", "googlesyndication", "googletagservices", "googletagmanager",
@@ -288,6 +441,149 @@ _injection_lock    = threading.Lock()
 _injection_ip_stats: dict = {}
 
 # ══════════════════════════════════════════════════════════════════════════════
+# SSAI / MANIFEST MANIPULATION DETECTION  (NEW)
+# ══════════════════════════════════════════════════════════════════════════════
+# Server-Side Ad Insertion (SSAI) — also called "manifest manipulation" — stitches
+# ad segments directly into MPEG-DASH (.mpd) or HLS (.m3u8) manifests at the
+# server level.  Because the ad chunks arrive as part of the main video stream,
+# client-side blockers usually cannot distinguish them.  However, the Ad Decision
+# Server (ADS), manifest-manipulator proxy, and VAST/VPAID tag endpoints all
+# require their OWN DNS lookups — which we CAN intercept here.
+#
+# Strategy
+# ────────
+# 1. SSAI_HOSTNAMES  — exact or wildcard domains known to be manifest-manipulator
+#    infrastructure (Yospace, Harmonic, MediaKind, AWS MediaTailor, etc.).
+# 2. SSAI_KEYWORDS   — substrings that appear in SSAI CDN / proxy hostnames.
+# 3. SSAI_REGEXES    — compiled patterns for ad-stitcher node naming conventions.
+# 4. MPD_PERIOD_SIGNAL_KEYWORDS — strings that appear in hostnames used to serve
+#    multi-period MPD ad-insertion "Representation" segments.
+# 5. SCTE35_SIGNAL_KEYWORDS — hostnames associated with SCTE-35 cue servers /
+#    signaling endpoints (separate from the stream CDN).
+#
+# When a DNS query matches any of the above, the domain is treated as an
+# SSAI_SIGNAL (weight 3.0) — high enough to exceed AD_CANDIDATE_SCORE_THRESHOLD
+# on its own — and is sunk immediately if AUTO_BLOCK_DISCOVERED_IMMEDIATELY=True.
+
+SSAI_DETECT_ENABLED = True   # master switch for all SSAI detection
+
+# Known SSAI / manifest-manipulator vendor hostnames (exact + parent-match)
+SSAI_HOSTNAMES: set = {
+    # AWS Elemental MediaTailor
+    "mediatailor.us-east-1.amazonaws.com",
+    "ad.us-east-1.mediatailor.amazonaws.com",
+    # Yospace (server-side ad insertion for Akamai / Harmonic)
+    "yospace.com", "csm.yospace.com",
+    # Harmonic / VOS
+    "harmonicinc.com", "vos360.video",
+    # Brightcove / Onceux SSAI
+    "onceux.com", "ssai.onceux.com",
+    # JW Player / Connatix ad stitching
+    "jwpltx.com", "cdn.jwplayer.com",
+    # Phenix Real-Time Solutions
+    "phenixrts.com",
+    # Akamai sidecar / SSAI nodes
+    "akamaized.net",          # broad parent — scored by SSAI keyword below too
+    "ssai.akamaized.net",
+    # Google DAI (Dynamic Ad Insertion) — separate from googlesyndication
+    "dai.google.com", "pubads.g.doubleclick.net",
+    # FreeWheel MRM
+    "freewheel.tv", "adm.fwmrm.net", "cdn.freewheel.tv",
+    # Comcast / NBCUniversal FreeWheel
+    "fwmrm.net",
+    # Verizon Media / Yahoo ConnectID
+    "uplynk.com", "api.uplynk.com", "content.uplynk.com",
+    # Ellation (Crunchyroll) SSAI
+    "ssai.crunchyroll.com",
+    # Generic SSAI SaaS
+    "adstitcher.com", "stitcher.com",
+    # SCTE-35 cue / signaling endpoints
+    "scte.org",
+}
+
+# Substring keywords strongly associated with SSAI infrastructure hostnames
+SSAI_KEYWORDS: list = [
+    "ssai", "dai-", "-dai.", "adstitc", "manifest-manip",
+    "adinsert", "ad-insert", "ad_insert",
+    "mediatailor", "adtailor",
+    "adbreak", "ad-break", "adbreaker",
+    "yospace", "freewheel", "fwmrm", "uplynk",
+    "vmap", "vmapurl",             # VMAP = Video Multiple Ad Playlist
+    "vast-tag", "vasttag", "vast_tag",
+    "vpaid-tag", "vpaidtag",
+    "adpod", "ad-pod", "ad_pod",   # ad pod = clustered mid-roll group
+    "multiperiod", "multi-period",
+    "adperiod", "ad-period",
+    "scte35", "scte-35", "cue-out", "cueout", "cuein", "cue-in",
+    "stitcher", "adstitch",
+    "beaconing", "adbeacon",
+    "admanifest", "ad-manifest",
+]
+
+# Regex patterns for SSAI CDN node naming conventions
+SSAI_REGEXES: list = [re.compile(p, re.IGNORECASE) for p in [
+    # AWS MediaTailor session / tracking endpoints
+    r"(^|\.)v[0-9]+\.mediatailor\.[a-z0-9-]+\.amazonaws\.com$",
+    # Yospace csm subdomains: csm-e.yospace.com, csm-a2.yospace.com
+    r"(^|\.)csm[-a-z0-9]*\.yospace\.com$",
+    # Generic SSAI proxy pattern: ssai.<anything>.<tld>
+    r"(^|\.)ssai\.[a-z0-9.-]+$",
+    # Uplynk / Verizon Media ad-stitching segment hosts
+    r"(^|\.)content\.uplynk\.com$",
+    r"(^|\.)ads[0-9]*\.uplynk\.com$",
+    # FreeWheel ad delivery CDN nodes
+    r"(^|\.)cdn[0-9]*\.fwmrm\.net$",
+    # Multi-period MPD ad segment path pattern embedded in hostname (rare but seen)
+    r"(^|\.)(adperiod|period[0-9]+-ad)\.[a-z0-9.-]+$",
+    # Google DAI session manifest hosts: dai-pa.googlevideo.com, etc.
+    r"(^|\.)dai[-a-z0-9]*\.googlevideo\.com$",
+    # SCTE-35 cue / signal API endpoints
+    r"(^|\.)(scte35|cue-?signal|adcue)[a-z0-9-]*\.[a-z0-9.-]+$",
+]]
+
+# Additional per-log insight tracking for SSAI events
+_ssai_lock             = threading.Lock()
+_ssai_blocked_domains: set = set()   # domains blocked via SSAI detection
+
+def _is_ssai_domain(domain: str) -> bool:
+    """
+    Returns True if *domain* matches any SSAI / manifest-manipulation signal:
+      • exact match or parent-domain match in SSAI_HOSTNAMES
+      • substring match in SSAI_KEYWORDS
+      • regex match in SSAI_REGEXES
+    """
+    if not SSAI_DETECT_ENABLED:
+        return False
+    d = domain.strip().lower().rstrip(".")
+    if not d:
+        return False
+
+    # 1. Exact / parent hostname match
+    parts = d.split(".")
+    for i in range(len(parts)):
+        if ".".join(parts[i:]) in SSAI_HOSTNAMES:
+            return True
+
+    # 2. Substring keyword match
+    for kw in SSAI_KEYWORDS:
+        if kw in d:
+            return True
+
+    # 3. Regex match
+    for rx in SSAI_REGEXES:
+        try:
+            if rx.search(d):
+                return True
+        except Exception:
+            pass
+
+    return False
+
+def _ssai_candidate_score(domain: str) -> float:
+    """Returns SSAI signal weight if domain is an SSAI host, else 0."""
+    return AD_SIGNAL_WEIGHTS["ssai_signal"] if _is_ssai_domain(domain) else 0.0
+
+# ══════════════════════════════════════════════════════════════════════════════
 # GLOBAL STATE
 # ══════════════════════════════════════════════════════════════════════════════
 shutdown_event  = threading.Event()
@@ -302,6 +598,11 @@ allowlist:         set = set()
 discovered_domains:set = set()
 _up_idx: int           = 0
 dns_cache: dict        = {}
+
+# ── Client IP allowlist ───────────────────────────────────────────────────────
+ip_allowlist_lock                  = threading.Lock()
+allowed_client_ips: set            = set()   # exact IPs, O(1) lookup
+allowed_client_networks: list      = []      # ipaddress network objects (CIDR entries, if any)
 
 _active_clients: dict  = {}
 _active_lock           = threading.Lock()
@@ -323,15 +624,19 @@ _query_blocked      = 0
 _query_allowed      = 0
 _query_cache_hits   = 0
 _query_doh_hits     = 0
+_query_ssai_blocked = 0   # new: dedicated SSAI block counter
+_query_ip_rejected  = 0   # new: clients rejected by the IP allowlist
 
 def _inc(counter: str, n: int = 1):
-    global _query_total, _query_blocked, _query_allowed, _query_cache_hits, _query_doh_hits
+    global _query_total, _query_blocked, _query_allowed, _query_cache_hits, _query_doh_hits, _query_ssai_blocked, _query_ip_rejected
     with _query_counter_lock:
-        if counter == "total":     _query_total     += n
-        elif counter == "blocked": _query_blocked   += n
-        elif counter == "allowed": _query_allowed   += n
-        elif counter == "cache":   _query_cache_hits+= n
-        elif counter == "doh":     _query_doh_hits  += n
+        if counter == "total":       _query_total        += n
+        elif counter == "blocked":   _query_blocked      += n
+        elif counter == "allowed":   _query_allowed      += n
+        elif counter == "cache":     _query_cache_hits   += n
+        elif counter == "doh":       _query_doh_hits     += n
+        elif counter == "ssai":      _query_ssai_blocked += n
+        elif counter == "ip_reject": _query_ip_rejected  += n
 
 # ══════════════════════════════════════════════════════════════════════════════
 # LOGGING HELPERS
@@ -350,19 +655,23 @@ def log_ad_insight(kind: str, client_ip: str, qname: str, detail: str = ""):
     _append_line(ad_insights_log, line)
 
 # ══════════════════════════════════════════════════════════════════════════════
-# LIVE TERMINAL STATS TICKER  (NEW)
+# LIVE TERMINAL STATS TICKER
 # ══════════════════════════════════════════════════════════════════════════════
 def _print_terminal_stats():
     """Prints a compact, color-coded stats summary directly to the terminal."""
     with _query_counter_lock:
-        total   = _query_total
-        blocked = _query_blocked
-        allowed = _query_allowed
-        cached  = _query_cache_hits
-        doh     = _query_doh_hits
+        total       = _query_total
+        blocked     = _query_blocked
+        allowed     = _query_allowed
+        cached      = _query_cache_hits
+        doh         = _query_doh_hits
+        ssai_blk    = _query_ssai_blocked
+        ip_rejected = _query_ip_rejected
     with _adstats_lock:
         unique_ads = len(_unique_ads_detected)
         new_adds   = len(_new_ads_added_total)
+    with _ssai_lock:
+        ssai_unique = len(_ssai_blocked_domains)
 
     block_pct = (blocked / max(1, total)) * 100
     cache_pct = (cached  / max(1, total)) * 100
@@ -373,17 +682,21 @@ def _print_terminal_stats():
     )
 
     line = (
-        f"\n{_c('BANNER')}┌─ AdVault Stats ─────────────────────────────────────────┐{_c('RESET')}\n"
+        f"\n{_c('BANNER')}┌─ AdVault Stats ──────────────────────────────────────────────┐{_c('RESET')}\n"
         f"{sep}"
         f"{label('Queries',  total)}{sep}"
         f"{label('Blocked',  f'{blocked} ({block_pct:.1f}%)', _c('STAT_BAD'))}{sep}"
         f"{label('Allowed',  allowed, _c('STAT_GOOD'))}{sep}"
         f"{label('Cache',    f'{cached} ({cache_pct:.1f}%)', _c('CACHE_HIT'))}{sep}"
         f"{label('DoH hits', doh)}{sep}"
+        f"{label('IP-rejected', ip_rejected, _c('STAT_BAD'))}{sep}"
         f"\n{sep}"
-        f"{label('Unique ads blocked', unique_ads, _c('STAT_BAD'))}{sep}"
-        f"{label('New domains added', new_adds, _c('DISCOVERY'))}{sep}"
-        f"\n{_c('BANNER')}└─────────────────────────────────────────────────────────┘{_c('RESET')}\n"
+        f"{label('Unique ads blocked',    unique_ads,  _c('STAT_BAD'))}{sep}"
+        f"{label('New domains added',     new_adds,    _c('DISCOVERY'))}{sep}"
+        f"\n{sep}"
+        f"{label('SSAI/Manifest blocks',  ssai_blk,   _c('SSAI'))}{sep}"
+        f"{label('Unique SSAI domains',   ssai_unique, _c('SSAI'))}{sep}"
+        f"\n{_c('BANNER')}└──────────────────────────────────────────────────────────────┘{_c('RESET')}\n"
     )
     print(line)
 
@@ -430,6 +743,78 @@ def is_private_or_special_ip(ip_str: str) -> bool:
         )
     except Exception:
         return False
+
+# ══════════════════════════════════════════════════════════════════════════════
+# CLIENT IP ALLOWLIST  — access control for the DNS service itself
+# ══════════════════════════════════════════════════════════════════════════════
+def load_ip_allowlist(path: str = None) -> None:
+    """
+    Load allowed_ips.txt into memory. Supports one entry per line:
+      - a plain IPv4/IPv6 address  (fast-path, O(1) set lookup)
+      - a CIDR range, e.g. 192.168.0.0/24  (checked against a small network list)
+      - blank lines and lines starting with '#' are ignored as comments
+    Safe to call again at any time (e.g. on SIGHUP) to hot-reload the list.
+    """
+    global allowed_client_ips, allowed_client_networks
+    path = path or IP_ALLOWLIST_FILE
+
+    ips: set = set()
+    nets: list = []
+    invalid = 0
+
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            for raw_line in f:
+                line = raw_line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                try:
+                    ips.add(str(ipaddress.ip_address(line)))
+                except ValueError:
+                    try:
+                        nets.append(ipaddress.ip_network(line, strict=False))
+                    except ValueError:
+                        invalid += 1
+    except FileNotFoundError:
+        log_message(
+            f"IP allowlist file not found: {path} — no clients will be permitted "
+            f"until it exists.",
+            _c("FATAL"),
+        )
+
+    with ip_allowlist_lock:
+        allowed_client_ips     = ips
+        allowed_client_networks = nets
+
+    if invalid:
+        log_message(f"IP allowlist: skipped {invalid} invalid line(s) in {path}.", _c("WARN"))
+    log_message(
+        f"IP allowlist loaded → {len(ips):,} address(es), {len(nets):,} CIDR range(s) from {path}.",
+        _c("OK"),
+    )
+
+def is_ip_allowed(ip_str: str) -> bool:
+    """O(1) fast-path against the exact-address set; falls back to a small
+    CIDR scan only if the allowlist actually contains any ranges."""
+    if not IP_ALLOWLIST_ENABLED:
+        return True
+    if not ip_str:
+        return False
+
+    with ip_allowlist_lock:
+        ips  = allowed_client_ips
+        nets = allowed_client_networks
+
+    if ip_str in ips:
+        return True
+    if not nets:
+        return False
+
+    try:
+        ip_obj = ipaddress.ip_address(ip_str)
+    except ValueError:
+        return False
+    return any(ip_obj in net for net in nets)
 
 # ══════════════════════════════════════════════════════════════════════════════
 # FILE I/O HELPERS
@@ -491,7 +876,7 @@ def looks_like_random_subdomain(domain: str) -> bool:
     return False
 
 # ══════════════════════════════════════════════════════════════════════════════
-# WEIGHTED AD CANDIDATE SCORING  (NEW)
+# WEIGHTED AD CANDIDATE SCORING
 # ══════════════════════════════════════════════════════════════════════════════
 def _keyword_in_domain_with_boundaries(keyword: str, domain: str) -> bool:
     """Boundary-aware match for short tokens to avoid false positives."""
@@ -506,7 +891,7 @@ def _keyword_in_domain_with_boundaries(keyword: str, domain: str) -> bool:
 
 def _ad_candidate_score(domain: str) -> float:
     """
-    Returns a numeric score representing how likely `domain` is an ad/tracker host.
+    Returns a numeric score representing how likely `domain` is an ad/tracker/SSAI host.
     Score >= AD_CANDIDATE_SCORE_THRESHOLD  →  treat as candidate.
     """
     d = _normalize_domain(domain)
@@ -515,12 +900,19 @@ def _ad_candidate_score(domain: str) -> float:
 
     score = 0.0
 
+    # SSAI / manifest-manipulation check (highest priority signal, checked first)
+    ssai_score = _ssai_candidate_score(d)
+    if ssai_score > 0:
+        score += ssai_score
+        # SSAI score alone exceeds threshold — skip remaining checks for speed
+        return score
+
     # Regex patterns
     for rx in AD_HOST_REGEXES:
         try:
             if rx.search(d):
                 score += AD_SIGNAL_WEIGHTS["regex_match"]
-                break  # one regex match is enough for full weight
+                break
         except Exception:
             pass
 
@@ -528,7 +920,7 @@ def _ad_candidate_score(domain: str) -> float:
     for kw in AD_HOST_KEYWORDS:
         if kw and kw in d:
             score += AD_SIGNAL_WEIGHTS["keyword_match"]
-            break  # one match is enough for full weight
+            break
 
     # AD marker keywords (boundary-aware)
     for kw in AD_MARKER_KEYWORDS:
@@ -569,6 +961,13 @@ def _record_new_ad_added(domain: str):
         _new_ads_added_total.add(d)
         _new_ads_added_since_write.add(d)
         _unique_ads_detected.add(d)
+
+def _record_ssai_blocked(domain: str):
+    d = _normalize_domain(domain)
+    if not d:
+        return
+    with _ssai_lock:
+        _ssai_blocked_domains.add(d)
 
 # ══════════════════════════════════════════════════════════════════════════════
 # DNS RECORD HELPERS
@@ -816,22 +1215,21 @@ def write_current_users_periodically():
             snap = _prune_and_snapshot(now)
             unique_networks = len(snap)
             total_unique_ads, total_new_added, new_since_write = _snapshot_ad_stats_for_dashboard()
+            with _ssai_lock:
+                ssai_count = len(_ssai_blocked_domains)
 
             lines = [
                 f"Current unique networks: {unique_networks}",
                 f"Total unique ads detected (this run): {total_unique_ads}",
                 f"Total newly detected ads added (this run): {total_new_added}",
                 f"Newly detected ads added (since last update): {new_since_write}",
+                f"SSAI/Manifest-manipulation domains blocked: {ssai_count}",
                 f"Updated: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
                 f"Active window: {USERS_ACTIVE_WINDOW}s  |  Write interval: {USERS_WRITE_INTERVAL}s",
                 "",
                 f"Active client IPs (last {USERS_ACTIVE_WINDOW}s):",
                 "IP\tq\tqps\trand%\tuniq~\tseen\tflags",
             ]
-
-            def _sort_key(item):
-                _, st = item
-                return (-int(st["q_win"]), -float(st["last"]), _[0] if False else "")
 
             for ip, st in sorted(snap.items(), key=lambda x: (-x[1]["q_win"], -x[1]["last"], x[0])):
                 age        = max(0.0, now - float(st["last"]))
@@ -864,6 +1262,12 @@ def detect_ad_markers(client_ip: str, qname: str, qtype: int):
         return
     d          = _normalize_domain(qname)
     qtype_name = QTYPE.get(qtype, str(qtype))
+
+    # Check for SSAI signal first (new)
+    if _is_ssai_domain(d):
+        detail = f"ssai_manifest_manipulator qtype={qtype_name}"
+        log_message(f"SSAI/MANIFEST SIGNAL: {d} ({detail})", _c("SSAI"))
+        log_ad_insight("SSAI_SIGNAL", client_ip, d, detail)
 
     marker_hits = [kw.lower() for kw in AD_MARKER_KEYWORDS
                    if _keyword_in_domain_with_boundaries(kw, d)]
@@ -917,9 +1321,9 @@ def detect_and_mitigate_ad_injection(request: DNSRecord, parsed_reply: DNSRecord
             if AUTO_BLOCK_INJECTED_CNAME:
                 reply = request.reply()
                 reply.header.rcode = RCODE.NOERROR
-                if qtype in (QTYPE.A,    QTYPE.ANY):
+                if qtype == QTYPE.A:
                     reply.add_answer(RR(qname, QTYPE.A,    rdata=A(SINK_IPv4),    ttl=60))
-                if qtype in (QTYPE.AAAA, QTYPE.ANY):
+                if qtype == QTYPE.AAAA:
                     reply.add_answer(RR(qname, QTYPE.AAAA, rdata=AAAA(SINK_IPv6), ttl=60))
                 log_message(f"INJECTION MITIGATED (sunk): {qname} (via {t})", _c("INJECTION"))
                 log_ad_insight("INJECTION_SUNK", client_ip, qname, f"via_cname={t}")
@@ -1015,13 +1419,13 @@ def parse_blocklist(raw_data: str) -> set:
     return domains
 
 # ══════════════════════════════════════════════════════════════════════════════
-# DNS-OVER-HTTPS UPSTREAM  (NEW)
+# DNS-OVER-HTTPS UPSTREAM
 # ══════════════════════════════════════════════════════════════════════════════
 _doh_session = requests.Session()
 _doh_session.headers.update({
     "Accept":       "application/dns-message",
     "Content-Type": "application/dns-message",
-    "User-Agent":   "AdVaultDNS/2.0",
+    "User-Agent":   "AdVaultDNS/3.0",
 })
 
 def _next_doh_url() -> str:
@@ -1234,6 +1638,30 @@ def resolve_query(query_bytes: bytes, client_ip: str = None) -> bytes:
         log_message(f"Query: {qname} [{QTYPE.get(qtype, qtype)}]", _c("QUERY"))
         detect_ad_markers(client_ip or "unknown", qname, qtype)
 
+        # ── SSAI / Manifest-manipulation check (new — runs before normal block) ─
+        if SSAI_DETECT_ENABLED and _is_ssai_domain(qname):
+            if not domain_in_set_or_parent(qname, allowlist_critical) and \
+               not domain_in_set_or_parent(qname, allowlist):
+                _inc("blocked")
+                _inc("ssai")
+                _record_unique_ad_detected(qname)
+                _record_ssai_blocked(qname)
+                # Auto-add to discovered so it persists across restarts
+                add_discovered_domain(qname)
+                log_message(
+                    f"SSAI BLOCKED  {qname}  [manifest-manipulator / ad-stitcher]",
+                    _c("SSAI"),
+                )
+                log_ad_insight("SSAI_BLOCKED", client_ip or "unknown", qname,
+                               f"qtype={QTYPE.get(qtype, str(qtype))}")
+                reply = request.reply()
+                reply.header.rcode = RCODE.NOERROR
+                if qtype == QTYPE.A:
+                    reply.add_answer(RR(qname, QTYPE.A,    rdata=A(SINK_IPv4),    ttl=60))
+                if qtype == QTYPE.AAAA:
+                    reply.add_answer(RR(qname, QTYPE.AAAA, rdata=AAAA(SINK_IPv6), ttl=60))
+                return reply.pack()
+
         if hostname_is_ad_candidate(qname):
             catalog_candidate(qname)
 
@@ -1245,9 +1673,9 @@ def resolve_query(query_bytes: bytes, client_ip: str = None) -> bytes:
             log_ad_insight("BLOCKED", client_ip or "unknown", qname,
                            f"qtype={QTYPE.get(qtype, str(qtype))}")
             reply = request.reply()
-            if qtype in (QTYPE.A,    QTYPE.ANY):
+            if qtype == QTYPE.A:
                 reply.add_answer(RR(qname, QTYPE.A,    rdata=A(SINK_IPv4),    ttl=60))
-            if qtype in (QTYPE.AAAA, QTYPE.ANY):
+            if qtype == QTYPE.AAAA:
                 reply.add_answer(RR(qname, QTYPE.AAAA, rdata=AAAA(SINK_IPv6), ttl=60))
             return reply.pack()
 
@@ -1313,9 +1741,9 @@ def resolve_query(query_bytes: bytes, client_ip: str = None) -> bytes:
                 _record_unique_ad_detected(qname)
                 reply = request.reply()
                 reply.header.rcode = RCODE.NOERROR
-                if qtype in (QTYPE.A,    QTYPE.ANY):
+                if qtype == QTYPE.A:
                     reply.add_answer(RR(qname, QTYPE.A,    rdata=A(SINK_IPv4),    ttl=60))
-                if qtype in (QTYPE.AAAA, QTYPE.ANY):
+                if qtype == QTYPE.AAAA:
                     reply.add_answer(RR(qname, QTYPE.AAAA, rdata=AAAA(SINK_IPv6), ttl=60))
                 log_message(f"AUTO-BLOCKED (immediate): {qname}", _c("AUTO_BLOCK"))
                 log_ad_insight("AUTO_BLOCK_IMMEDIATE", client_ip or "unknown", qname,
@@ -1358,10 +1786,14 @@ def start_udp_server(host=LISTEN_HOST, port=DNS_UDP_PORT, workers=UDP_WORKERS):
         return
 
     with ThreadPoolExecutor(max_workers=int(workers)) as pool:
-        sock.settimeout(0.5)
+        sock.settimeout(4.0)
         while not shutdown_event.is_set():
             try:
                 data, addr = sock.recvfrom(65535)
+                if not is_ip_allowed(addr[0]):
+                    _inc("ip_reject")
+                    log_message(f"IP DENIED  {addr[0]} (UDP, not in allowlist)", _c("IP_DENIED"))
+                    continue
                 pool.submit(_udp_handle_one, sock, data, addr)
             except socket.timeout:
                 continue
@@ -1413,6 +1845,12 @@ def start_tcp_server(host=LISTEN_HOST, port=DNS_TCP_PORT):
         while not shutdown_event.is_set():
             try:
                 client, addr = srv.accept()
+                if not is_ip_allowed(addr[0]):
+                    _inc("ip_reject")
+                    log_message(f"IP DENIED  {addr[0]} (TCP, not in allowlist)", _c("IP_DENIED"))
+                    try: client.close()
+                    except Exception: pass
+                    continue
                 threading.Thread(target=_tcp_client_loop, args=(client, addr), daemon=True).start()
             except socket.timeout:
                 continue
@@ -1426,14 +1864,15 @@ def start_tcp_server(host=LISTEN_HOST, port=DNS_TCP_PORT):
 # ── DNS-over-TLS Server ───────────────────────────────────────────────────────
 class DoTServer(threading.Thread):
     def __init__(self, host=LISTEN_HOST, port=DOT_PORT,
-                 certfile=DOT_CERTFILE, keyfile=DOT_KEYFILE,
+                 certfile=None, keyfile=None,
                  tls_min_version=ssl.TLSVersion.TLSv1_2,
                  ciphers=None, client_timeout=30.0, backlog=200):
         super().__init__(daemon=True)
         self.host           = host
         self.port           = port
-        self.certfile       = certfile
-        self.keyfile        = keyfile
+        cert_abs, key_abs   = _resolve_dot_paths()
+        self.certfile       = certfile if certfile else cert_abs
+        self.keyfile        = keyfile  if keyfile  else key_abs
         self.client_timeout = client_timeout
         self.backlog        = backlog
         self._shutdown      = threading.Event()
@@ -1464,6 +1903,12 @@ class DoTServer(threading.Thread):
                     continue
                 except OSError:
                     break
+                if not is_ip_allowed(addr[0]):
+                    _inc("ip_reject")
+                    log_message(f"IP DENIED  {addr[0]} (DoT, not in allowlist)", _c("IP_DENIED"))
+                    try: client.close()
+                    except Exception: pass
+                    continue
                 threading.Thread(target=self.handle_client, args=(client, addr), daemon=True).start()
         finally:
             try: base.close()
@@ -1506,6 +1951,7 @@ def reload_all_lists(reason: str = "signal"):
         compact_discovered_blocklist()
         update_blocklist_preserve()
         load_lists_into_memory()
+        load_ip_allowlist()
     except Exception as e:
         log_message(f"Reload failed: {e}", _c("ERROR"))
 
@@ -1533,12 +1979,21 @@ if __name__ == "__main__":
     log_message(f"AdVault DNS starting up — PID {os.getpid()}", _c("OK"))
     log_message(f"DoH upstreams: {', '.join(DOH_UPSTREAMS) if DOH_ENABLED else 'DISABLED'}", _c("INFO"))
     log_message(f"Plain UDP/TCP upstreams: {UPSTREAMS}", _c("INFO"))
+    log_message(f"SSAI/Manifest-manipulation detection: {'ENABLED' if SSAI_DETECT_ENABLED else 'DISABLED'}", _c("SSAI"))
+    log_message(f"Client IP allowlist: {'ENABLED (' + IP_ALLOWLIST_FILE + ')' if IP_ALLOWLIST_ENABLED else 'DISABLED — all clients permitted'}", _c("INFO"))
 
     try:
         compact_discovered_blocklist()
         log_message("Updating blocklist (no deletions)…", _c("INFO"))
         update_blocklist_preserve()
         load_lists_into_memory()
+
+        # Load client IP allowlist — must happen before any server starts
+        # accepting connections, since every server checks it at accept-time.
+        load_ip_allowlist()
+
+        # Auto-generate TLS cert/key if not already present
+        auto_generate_dot_certificates()
 
         # DoT server
         dot = None
