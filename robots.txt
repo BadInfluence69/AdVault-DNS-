@@ -1,4 +1,2 @@
 User-agent: *
-Allow: /
-
-Sitemap: http://185.107.97.246/Advaulu/sitemap.xml
+Disallow:
