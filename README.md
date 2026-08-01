@@ -30,6 +30,32 @@ Python Releases for Windows
 https://www.python.org/downloads/windows/
 
 ---------------------------------------------------------
++-----------------------------------------------------------------------------------+
+|                                  ADVAULT CORE ENGINE                              |
+|                                                                                   |
+|  [ Inbound Client Request ]                                                       |
+|             |                                                                     |
+|             v                                                                     |
+|  +-----------------------+      Matches Local IP Blocklist / Excessive QPS?       |
+|  | Token-Bucket Limiter  | -------------------------------------> [ RCODE.REFUSED ] |
+|  +-----------------------+                                                        |
+|             | (Passed)                                                            |
+|             v                                                                     |
+|  +-----------------------+      In LRU OrderedDict Cache?                         |
+|  | 4,096-Entry Cache     | -------------------------------------> [ Return Fast ] |
+|  +-----------------------+                                                        |
+|             | (Cache Miss)                                                        |
+|             v                                                                     |
+|  +-----------------------+      Is Ad / Tracking / SSAI Domain?                   |
+|  | O(1) Regex / Frozenset| -------------------------------------> [ Null-Packet   ] |
+|  +-----------------------+                                        [ Spoof Server  ] |
+|             | (Clean Domain)                                                      |
+|             v                                                                     |
+|  +-----------------------+                                                        |
+|  | Upstream Quad9 (9.9.9.9)| ----> Thread-Safe DoH / DNSSEC Validated Outbound        |
+|  +-----------------------+                                                        |
++-----------------------------------------------------------------------------------+
+
 DNS ad blocker
 
 DNS-based ad blocking
