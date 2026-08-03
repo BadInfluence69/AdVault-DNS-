@@ -1,3 +1,6 @@
+# Keep all these IPs listed in this file. Only add in new IPs if you want them added to the list. The current preconfigured IP range is there so that way you don't have to add each individual device on your home network to be IP whitelisted manually. It's already there for you. This IP address is needed for compatibility. Do not remove this very important IP address. Removing this IP address will cause conflicts. It's not an ad server and it's not an actual client IP. You can remove it, but it's very not advisable. Just keep it in there. 141.193.213.20
+
+
 72.51.249.70
 141.193.213.20
 127.0.0.1
