@@ -1,5 +1,6 @@
 # python DNS_Ad_Blocker.py
 # ipconfig /flushdns
+# mitmdump -s manifest_filter.py --listen-port 8080
 
 import os
 import io
@@ -20,7 +21,7 @@ from collections import defaultdict, deque, Counter
 from concurrent.futures import ThreadPoolExecutor
 
 import requests
-from dnslib import DNSRecord, QTYPE, RR, A, AAAA, RCODE
+from dnslib import DNSRecord, QTYPE, RR, A, AAAA, RCODE, SOA
 from colorama import Fore, Back, Style, init
 
 # ── stdout/stderr resilience ──────────────────────────────────────────────────
@@ -269,12 +270,39 @@ _doh_idx      = 0
 _doh_idx_lock = threading.Lock()
 
 # ── Sinkhole IPs ──────────────────────────────────────────────────────────────
-# IPv4 sinkhole for blocked domains.
-# IPv6 intentionally set to an IPv4 address — this is deliberate: it causes
-# AAAA lookups for blocked domains to fail cleanly, preventing ad networks
-# from using IPv6 as a backdoor or backup delivery path around the sinkhole.
-SINK_IPv4 = "107.149.207.104"
-SINK_IPv6 = "::"   # unspecified address — makes AAAA lookups for blocked domains fail cleanly
+# CRITICAL: these MUST be non-routable. A blocked domain that resolves to a
+# reachable-looking public address makes the client open a TCP connection that
+# never completes — it hangs for the full OS connect timeout (20s+ on most
+# stacks). For a video player, that stall is indistinguishable from a hung ad
+# server and freezes the playback pipeline. Fail FAST, never slow.
+SINK_IPv4 = "0.0.0.0"   # unspecified — immediate local failure, no packet sent
+SINK_IPv6 = "::"        # unspecified — same, for AAAA
+
+# ── Block response strategy ───────────────────────────────────────────────────
+# How to answer a query for a blocked domain. Different players react to
+# different failure signals; this is tunable per-deployment.
+#
+#   "nxdomain" — RCODE=3 + SOA. Fastest, cleanest failure. Stub resolvers
+#                negative-cache it (RFC 2308) so repeat lookups during a
+#                stream cost nothing. Best default for video.
+#   "null"     — NOERROR + 0.0.0.0 / ::. Connection fails instantly at the
+#                socket layer. Use if a player misbehaves on NXDOMAIN.
+#   "refused"  — RCODE=5. Fast, but some stubs then retry a secondary DNS
+#                server and route around the block entirely. Avoid.
+BLOCK_MODE = "nxdomain"
+
+# Negative-cache TTL advertised in the SOA MINIMUM field, in seconds.
+# Kept short so unblocking a domain takes effect quickly, but long enough
+# that a player fetching segments every few seconds doesn't re-query on
+# every single segment boundary.
+BLOCK_NEGATIVE_TTL = 60
+
+# Two-part public suffixes, for picking a sane SOA owner name.
+_TWO_PART_TLDS = {
+    "co.uk", "org.uk", "ac.uk", "gov.uk", "co.jp", "or.jp", "ne.jp",
+    "com.au", "net.au", "org.au", "co.nz", "com.br", "com.mx", "co.in",
+    "com.cn", "com.tr", "co.za", "com.sg", "co.kr", "com.tw",
+}
 
 
 CACHE_MAX_ENTRIES = 60
@@ -363,6 +391,40 @@ allowlist_critical = {
 
 # ── Ad host keyword list ──────────────────────────────────────────────────────
 AD_HOST_KEYWORDS_RAW = [
+    #// feed / homepage
+        'ytd-ad-slot-renderer',
+        'ytd-in-feed-ad-layout-renderer',
+        'ytd-banner-promo-renderer',
+        'ytd-banner-promo-renderer-background',
+        'ytd-statement-banner-renderer',
+        'ytd-primetime-promo-renderer',
+        'ytd-brand-video-shelf-renderer',
+        'ytd-brand-video-singleton-renderer',
+        'ytd-inline-survey-renderer',
+        '#masthead-ad',
+        #// search
+        'ytd-promoted-sparkles-web-renderer',
+        'ytd-promoted-sparkles-text-search-renderer',
+        'ytd-promoted-video-renderer',
+        'ytd-search-pyv-renderer',
+        'ytd-carousel-ad-renderer',
+       # // watch page
+        'ytd-display-ad-renderer',
+        'ytd-compact-promoted-video-renderer',
+        'ytd-compact-promoted-item-renderer',
+        'ytd-action-companion-ad-renderer',
+        'ytd-companion-slot-renderer',
+        'ytd-player-legacy-desktop-watch-ads-renderer',
+        '#player-ads',
+        '#offer-module',
+        # // mobile
+        'ytm-promoted-video-renderer',
+        'ytm-promoted-sparkles-web-renderer',
+        'ytm-companion-slot',
+        'ytm-carousel-ad-renderer',
+    r"HLS", r"DASH",
+    r"page_ads",
+    r"timestamp",
     r"origin-trial",
     r"EXT-X-CUE-OUT",
     r"SCTE-35",
@@ -405,6 +467,7 @@ for _kw in AD_HOST_KEYWORDS_RAW:
         AD_HOST_KEYWORDS.append(_k.lower())
 
 keyword_blocklist = list(set([
+    "ssai.",
     "scte-35", "banner", "advertisement",
     "trafficjunky.com", "media.trafficjunky.net", "ads.trafficjunky.com",
     "track.trafficjunky.com", "cdn.trafficjunky.com",
@@ -467,6 +530,42 @@ _injection_ip_stats: dict = {}
 
 SSAI_DETECT_ENABLED = True   # master switch for all SSAI detection
 
+# ── DELEGATION TO THE MANIFEST FILTER ────────────────────────────────────────
+# With true SSAI, the ad segments and the show are served by the SAME hostname.
+# That is the whole design: the stitcher hides ads behind the content CDN
+# precisely so a name-based blocker cannot separate them. So a DNS-layer block
+# on one of these hosts does not remove the ad — it removes the programme.
+#
+# The fix is a division of labour:
+#   • DNS kills the hosts that ONLY do ad work — decision servers, VAST tag
+#     endpoints, beacon and tracking collectors. Nothing of value is lost.
+#   • manifest_filter.py handles the dual-purpose hosts, editing the .m3u8 /
+#     .mpd in flight to drop the ad segments while the content flows through.
+#
+# Set this False only if you are not running the manifest filter and would
+# rather lose playback on these services than see the stitched ads.
+SSAI_DELEGATE_TO_MANIFEST_FILTER = True
+
+# Hostnames that serve REAL VIDEO as well as stitched ads. Never sinkholed
+# while delegation is on; the manifest filter cleans them instead.
+SSAI_CONTENT_HOSTS: set = {
+    "akamaized.net",          # enormous shared CDN — blocking the parent here
+                              # takes down a large share of the video web
+    "content.uplynk.com",     # Uplynk segment delivery (Disney/ABC/ESPN stack)
+    "cdn.jwplayer.com",       # JW Player content delivery, not just ad calls
+    "dai.google.com",         # DAI *session* manifests carry the show too
+    "mediatailor.us-east-1.amazonaws.com",
+    "ssai.crunchyroll.com",
+    "vos360.video",
+}
+
+def _is_ssai_content_host(domain: str) -> bool:
+    """True if *domain* is a host that carries real content as well as ads."""
+    if not SSAI_DELEGATE_TO_MANIFEST_FILTER:
+        return False
+    parts = domain.split(".")
+    return any(".".join(parts[i:]) in SSAI_CONTENT_HOSTS for i in range(len(parts)))
+
 # Known SSAI / manifest-manipulator vendor hostnames (exact + parent-match)
 SSAI_HOSTNAMES: set = {
     # AWS Elemental MediaTailor
@@ -474,6 +573,7 @@ SSAI_HOSTNAMES: set = {
     "ad.us-east-1.mediatailor.amazonaws.com",
     # Yospace (server-side ad insertion for Akamai / Harmonic)
     "yospace.com", "csm.yospace.com",
+    "ytp-overlay", "ytp-speedmaster-overlay",
     # Harmonic / VOS
     "harmonicinc.com", "vos360.video",
     # Brightcove / Onceux SSAI
@@ -556,6 +656,13 @@ def _is_ssai_domain(domain: str) -> bool:
         return False
     d = domain.strip().lower().rstrip(".")
     if not d:
+        return False
+
+    # 0. Dual-purpose host — resolve it normally and let manifest_filter.py
+    #    strip the ads out of the playlist. Sinkholing here would kill the
+    #    content along with the ad, which is the failure this whole feature
+    #    exists to avoid.
+    if _is_ssai_content_host(d):
         return False
 
     # 1. Exact / parent hostname match
@@ -1319,15 +1426,10 @@ def detect_and_mitigate_ad_injection(request: DNSRecord, parsed_reply: DNSRecord
                 except Exception: pass
 
             if AUTO_BLOCK_INJECTED_CNAME:
-                reply = request.reply()
-                reply.header.rcode = RCODE.NOERROR
-                if qtype == QTYPE.A:
-                    reply.add_answer(RR(qname, QTYPE.A,    rdata=A(SINK_IPv4),    ttl=60))
-                if qtype == QTYPE.AAAA:
-                    reply.add_answer(RR(qname, QTYPE.AAAA, rdata=AAAA(SINK_IPv6), ttl=60))
                 log_message(f"INJECTION MITIGATED (sunk): {qname} (via {t})", _c("INJECTION"))
                 log_ad_insight("INJECTION_SUNK", client_ip, qname, f"via_cname={t}")
-                return reply.pack()
+                # Fast-fail: answers every qtype, negative-cacheable, no hang.
+                return build_block_reply(request, qname)
             break
 
     ips_with_ttl = _collect_a_aaaa_answers(parsed_reply)
@@ -1556,6 +1658,105 @@ def is_blocked(domain: str) -> bool:
 # ══════════════════════════════════════════════════════════════════════════════
 # DNS CACHE
 # ══════════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════════
+# FAST-FAIL BLOCK RESPONSES
+#
+# A blocked lookup must fail *immediately* and *completely*. Every millisecond
+# a player spends waiting on a blocked ad call is a millisecond its buffer
+# drains. The three failure modes that cause stalls, all fixed here:
+#
+#   1. Slow failure  — sinkholing to a routable IP means the client waits out
+#                      a full TCP connect timeout. Fixed by 0.0.0.0 / ::.
+#   2. Silent NODATA — returning NOERROR with an empty answer and no authority
+#                      section gives the stub nothing to cache, so it re-queries
+#                      on every segment boundary and may wait out its own timer.
+#                      Fixed by always attaching an SOA.
+#   3. Half answers  — answering A but leaving AAAA (or HTTPS/SVCB, qtype 65,
+#                      which modern players query first) unanswered strands
+#                      dual-stack clients in Happy Eyeballs fallback timers.
+#                      Fixed by answering every qtype authoritatively.
+# ══════════════════════════════════════════════════════════════════════════════
+def _soa_zone_for(qname: str) -> str:
+    """
+    Pick a plausible zone name to own the SOA record. Stub resolvers key their
+    negative cache off this, so it should be the registrable domain rather than
+    the full queried name — that way one blocked lookup suppresses re-queries
+    for sibling hostnames in the same ad zone too.
+    """
+    labels = qname.strip(".").split(".")
+    if len(labels) <= 2:
+        return qname.strip(".") or "."
+    last_two = ".".join(labels[-2:])
+    if last_two in _TWO_PART_TLDS and len(labels) >= 3:
+        return ".".join(labels[-3:])
+    return last_two
+
+
+def _attach_block_soa(reply, qname: str, ttl: int = None):
+    """
+    Attach an SOA to the authority section so the client negative-caches the
+    failure for BLOCK_NEGATIVE_TTL instead of re-asking every few seconds.
+    Per RFC 2308 the effective negative TTL is min(SOA.ttl, SOA.minimum).
+    """
+    ttl  = BLOCK_NEGATIVE_TTL if ttl is None else ttl
+    zone = _soa_zone_for(qname)
+    try:
+        reply.add_auth(RR(
+            zone, QTYPE.SOA, ttl=ttl,
+            rdata=SOA(
+                mname="localhost.",
+                rname="advault.localhost.",
+                times=(
+                    int(time.time()),   # serial
+                    3600,               # refresh
+                    600,                # retry
+                    86400,              # expire
+                    ttl,                # minimum → the negative TTL
+                ),
+            ),
+        ))
+    except Exception as e:
+        # Never let SOA construction turn a fast block into a resolver error.
+        log_message(f"SOA attach failed for {qname}: {e}", _c("WARN"))
+    return reply
+
+
+def build_block_reply(request, qname: str, mode: str = None, ttl: int = 60) -> bytes:
+    """
+    Build a complete, fast-failing response for a blocked domain.
+
+    Answers EVERY query type authoritatively — no silent NODATA, no unanswered
+    AAAA or HTTPS record leaving the client on a timer. Returns packed wire
+    bytes ready to send.
+    """
+    mode  = (mode or BLOCK_MODE).lower()
+    qtype = request.q.qtype
+    reply = request.reply()
+
+    if mode == "refused":
+        reply.header.rcode = RCODE.REFUSED
+        return reply.pack()
+
+    if mode == "null":
+        # NOERROR plus an unspecified address: the connect() fails instantly
+        # in the local stack without a packet ever leaving the machine.
+        reply.header.rcode = RCODE.NOERROR
+        if qtype == QTYPE.A:
+            reply.add_answer(RR(qname, QTYPE.A, rdata=A(SINK_IPv4), ttl=ttl))
+        elif qtype == QTYPE.AAAA:
+            reply.add_answer(RR(qname, QTYPE.AAAA, rdata=AAAA(SINK_IPv6), ttl=ttl))
+        else:
+            # Every other type (HTTPS/SVCB 65, TXT, SRV, ...) gets an explicit
+            # authoritative NODATA so the client stops waiting and stops asking.
+            _attach_block_soa(reply, qname, ttl)
+        return reply.pack()
+
+    # Default: NXDOMAIN + SOA — the cleanest, fastest signal for a video player.
+    reply.header.rcode = RCODE.NXDOMAIN
+    _attach_block_soa(reply, qname, ttl)
+    return reply.pack()
+
+
 def cache_get(qname: str, qtype: int):
     k = (qname, qtype)
     with cache_lock:
@@ -1654,13 +1855,8 @@ def resolve_query(query_bytes: bytes, client_ip: str = None) -> bytes:
                 )
                 log_ad_insight("SSAI_BLOCKED", client_ip or "unknown", qname,
                                f"qtype={QTYPE.get(qtype, str(qtype))}")
-                reply = request.reply()
-                reply.header.rcode = RCODE.NOERROR
-                if qtype == QTYPE.A:
-                    reply.add_answer(RR(qname, QTYPE.A,    rdata=A(SINK_IPv4),    ttl=60))
-                if qtype == QTYPE.AAAA:
-                    reply.add_answer(RR(qname, QTYPE.AAAA, rdata=AAAA(SINK_IPv6), ttl=60))
-                return reply.pack()
+                # Fast-fail: answers every qtype, negative-cacheable, no hang.
+                return build_block_reply(request, qname)
 
         if hostname_is_ad_candidate(qname):
             catalog_candidate(qname)
@@ -1672,12 +1868,8 @@ def resolve_query(query_bytes: bytes, client_ip: str = None) -> bytes:
             log_message(f"BLOCKED  {qname}", _c("BLOCKED"))
             log_ad_insight("BLOCKED", client_ip or "unknown", qname,
                            f"qtype={QTYPE.get(qtype, str(qtype))}")
-            reply = request.reply()
-            if qtype == QTYPE.A:
-                reply.add_answer(RR(qname, QTYPE.A,    rdata=A(SINK_IPv4),    ttl=60))
-            if qtype == QTYPE.AAAA:
-                reply.add_answer(RR(qname, QTYPE.AAAA, rdata=AAAA(SINK_IPv6), ttl=60))
-            return reply.pack()
+            # Fast-fail: answers every qtype, negative-cacheable, no hang.
+            return build_block_reply(request, qname)
 
         _inc("allowed")
         log_message(f"ALLOWED  {qname}", _c("ALLOWED"))
@@ -1739,16 +1931,11 @@ def resolve_query(query_bytes: bytes, client_ip: str = None) -> bytes:
             added = add_discovered_domain(qname)
             if added and AUTO_BLOCK_DISCOVERED_IMMEDIATELY:
                 _record_unique_ad_detected(qname)
-                reply = request.reply()
-                reply.header.rcode = RCODE.NOERROR
-                if qtype == QTYPE.A:
-                    reply.add_answer(RR(qname, QTYPE.A,    rdata=A(SINK_IPv4),    ttl=60))
-                if qtype == QTYPE.AAAA:
-                    reply.add_answer(RR(qname, QTYPE.AAAA, rdata=AAAA(SINK_IPv6), ttl=60))
                 log_message(f"AUTO-BLOCKED (immediate): {qname}", _c("AUTO_BLOCK"))
                 log_ad_insight("AUTO_BLOCK_IMMEDIATE", client_ip or "unknown", qname,
                                f"qtype={QTYPE.get(qtype, str(qtype))}")
-                return reply.pack()
+                # Fast-fail: answers every qtype, negative-cacheable, no hang.
+                return build_block_reply(request, qname)
 
         cache_put(qname, qtype, parsed)
         log_message(f"RESOLVED  {qname}", _c("RESOLVED"))
