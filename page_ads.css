@@ -1,0 +1,68 @@
+/* ============================================================
+   page_ads.css — static (non-video) ad hiding for youtube.com
+   ------------------------------------------------------------
+   Injected at document_start so ad elements never paint. This
+   file only HIDES; page_ads.js does the structural pruning that
+   keeps the grid from leaving empty holes where an ad was.
+
+   Nothing here touches the <video> elements, the player chrome,
+   or any of the network/JSON interception in the other three
+   scripts. It is purely cosmetic layout filtering.
+   ============================================================ */
+
+/* ---- Feed / homepage ads ---------------------------------- */
+ytd-ad-slot-renderer,
+ytd-in-feed-ad-layout-renderer,
+ytd-banner-promo-renderer,
+ytd-banner-promo-renderer-background,
+ytd-statement-banner-renderer,
+ytd-primetime-promo-renderer,
+ytd-brand-video-shelf-renderer,
+ytd-brand-video-singleton-renderer,
+ytd-inline-survey-renderer,
+#masthead-ad,
+
+/* ---- Search-result ads ------------------------------------ */
+ytd-promoted-sparkles-web-renderer,
+ytd-promoted-sparkles-text-search-renderer,
+ytd-promoted-video-renderer,
+ytd-search-pyv-renderer,
+ytd-carousel-ad-renderer,
+
+/* ---- Watch page: sidebar + below-player companions -------- */
+ytd-display-ad-renderer,
+ytd-compact-promoted-video-renderer,
+ytd-compact-promoted-item-renderer,
+ytd-action-companion-ad-renderer,
+ytd-companion-slot-renderer,
+ytd-player-legacy-desktop-watch-ads-renderer,
+#player-ads,
+#offer-module,
+
+/* ---- Mobile layout (m.youtube.com) ------------------------ */
+ytm-promoted-video-renderer,
+ytm-promoted-sparkles-web-renderer,
+ytm-companion-slot,
+ytm-carousel-ad-renderer,
+
+/* ---- Grid/list wrappers that contain only an ad ----------- */
+ytd-rich-item-renderer:has(> #content > ytd-ad-slot-renderer),
+ytd-rich-item-renderer:has(> #content > ytd-in-feed-ad-layout-renderer),
+ytd-rich-item-renderer:has(> #content > ytd-display-ad-renderer),
+ytd-rich-section-renderer:has(ytd-statement-banner-renderer),
+ytd-rich-section-renderer:has(ytd-brand-video-shelf-renderer),
+ytd-rich-section-renderer:has(ytd-inline-survey-renderer) {
+    display: none !important;
+}
+
+/* Some ad containers are laid out by the grid before their
+   children exist, so they reserve height even when empty. */
+ytd-rich-item-renderer:has(> #content > ytd-ad-slot-renderer),
+ytd-ad-slot-renderer,
+#masthead-ad,
+#player-ads {
+    height: 0 !important;
+    min-height: 0 !important;
+    margin: 0 !important;
+    padding: 0 !important;
+}

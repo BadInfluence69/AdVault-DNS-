@@ -1,0 +1,28 @@
+{
+  "manifest_version": 3,
+  "name": "Youtube Premium",
+  "version": "1.1.0",
+  "author": "Brian Cambron",
+  "description": "Youtube Premium extension",
+  "permissions": [
+    "scripting"
+  ],
+  "host_permissions": [
+    "*://*.youtube.com/*"
+  ],
+  "content_scripts": [
+    {
+      "matches": ["*://*.youtube.com/*"],
+      "js": ["player_guard.user.js","content.js","cleaner.js"],
+      "run_at": "document_start",
+      "world": "MAIN"
+    },
+    {
+      "matches": ["*://*.youtube.com/*"],
+      "js": ["page_ads.js"],
+      "css": ["page_ads.css"],
+      "run_at": "document_start",
+      "all_frames": false
+    }
+  ]
+}
